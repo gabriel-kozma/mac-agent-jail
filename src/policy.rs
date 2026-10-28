@@ -1,0 +1,1058 @@
+//! Resolve settings, the agent, and host facts into a Seatbelt [`Profile`].
+
+use std::path::{Path, PathBuf};
+
+use crate::{
+    agents::{Agent, expand_home},
+    config::{NetworkMode, Settings},
+    profile::{
+        Match, Network, Profile, Rule, Section, ancestors, regex_escape,
+    },
+};
+
+/// System locations needed to exec ordinary programs and load their
+/// libraries. `/opt` holds Homebrew on Apple Silicon; `/usr/local` (under
+/// `/usr`) holds it on Intel.
+const SYSTEM_READ: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/private/etc",
+    "/Library",
+    "/opt",
+    "/dev",
+    "/nix",
+    "/private/var/db/timezone",
+    "/private/var/select/sh",
+    "/private/var/db/xcode_select_link",
+];
+
+/// Nodes on the way to allowed paths that are symlinks or roots on macOS
+/// (`/etc`, `/var`, `/tmp` all point into `/private`).
+const SYSTEM_METADATA: &[&str] = &[
+    "/private",
+    "/etc",
+    "/var",
+    "/tmp",
+    "/private/tmp",
+    "/private/var",
+    "/private/var/select",
+    "/private/var/run",
+];
+
+/// Language toolchains and developer config under `$HOME`, read-only.
+const HOME_TOOLCHAINS: &[&str] = &[
+    ".local/bin",
+    ".local/share/mise",
+    ".config/mise",
+    ".nvm",
+    ".volta",
+    ".fnm",
+    "Library/Application Support/fnm",
+    ".cargo/bin",
+    ".rustup",
+    ".pyenv",
+    ".rbenv",
+    ".asdf",
+    ".bun/bin",
+    ".deno",
+    "go/bin",
+    ".sdkman",
+    ".jenv",
+    ".gem",
+    "Library/Python",
+    ".terminfo",
+    ".tool-versions",
+    ".gitconfig",
+    ".gitignore",
+    ".gitignore_global",
+    ".gitattributes",
+    ".config/git",
+    ".editorconfig",
+];
+
+/// Package-manager caches under `$HOME`, read-write.
+const HOME_CACHES: &[&str] = &[
+    ".cache",
+    ".npm",
+    "Library/Caches",
+    ".cargo/registry",
+    ".cargo/git",
+    "go/pkg/mod",
+    ".bun/install/cache",
+    "Library/pnpm",
+    ".local/share/pnpm",
+    ".yarn",
+    ".gradle",
+    ".m2/repository",
+    ".node-gyp",
+    ".local/state/mise",
+];
+
+/// Credential stores that stay hidden even when a broader grant (for
+/// example `--ro ~`) would otherwise cover them.
+const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".azure",
+    ".oci",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".password-store",
+    ".config/gh",
+    ".config/gcloud",
+    ".config/op",
+    ".gem/credentials",
+    "Library/Mail",
+    "Library/Messages",
+    "Library/Safari",
+    "Library/Cookies",
+    "Library/Application Support/1Password",
+];
+
+const BASE_MACH_SERVICES: &[&str] = &[
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfprefsd.agent",
+    "com.apple.system.logger",
+    "com.apple.logd",
+    "com.apple.system.notification_center",
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.SystemConfiguration.configd",
+    "com.apple.SystemConfiguration.DNSConfiguration",
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+    "com.apple.ocspd",
+    "com.apple.FSEvents",
+];
+
+/// Services behind the Security framework's Keychain APIs: the legacy file
+/// keychain (SecurityServer), the data-protection keychain (securityd.xpc),
+/// Touch ID / password prompts (CoreAuthentication), and smart-card tokens
+/// that every item query enumerates (ctkd).
+const KEYCHAIN_MACH_SERVICES: &[&str] = &[
+    "com.apple.SecurityServer",
+    "com.apple.securityd",
+    "com.apple.securityd.xpc",
+    "com.apple.security.agent",
+    "com.apple.CoreAuthentication.daemon",
+    "com.apple.CoreAuthentication.agent",
+    "com.apple.ctkd.token-client",
+    "com.apple.ctkd.slot-client",
+];
+
+const OPEN_URL_MACH_SERVICES: &[&str] = &[
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.lsd.mapdb",
+    "com.apple.lsd.modifydb",
+    "com.apple.lsd.open",
+];
+
+const CLIPBOARD_MACH_SERVICES: &[&str] = &["com.apple.pasteboard.1"];
+
+const DEFAULT_HIDE: &[&str] = &[".env", ".env.*"];
+const DEFAULT_HIDE_EXCEPTIONS: &[&str] =
+    &["example", "sample", "template", "dist"];
+
+/// Host facts the policy depends on. Collected once in `main.rs` and
+/// injected so the resolver is testable.
+#[derive(Clone, Debug, Default)]
+pub struct Host {
+    /// Canonical home directory.
+    pub home: PathBuf,
+    pub uid: u32,
+    /// Darwin's per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`).
+    pub user_cache_dir: Option<PathBuf>,
+    /// This run's private TMPDIR.
+    pub session_dir: Option<PathBuf>,
+    /// The canonical path of this executable (Codex `ps` shim target).
+    pub exe: Option<PathBuf>,
+    /// Host PATH entries.
+    pub path: Vec<PathBuf>,
+    pub ssh_auth_sock: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+pub struct Request<'a> {
+    pub settings: &'a Settings,
+    pub agent: Option<Agent>,
+    /// Canonical project directory.
+    pub project: &'a Path,
+    /// The program as found on PATH (not canonicalized).
+    pub program: Option<&'a Path>,
+    pub tty: Option<&'a Path>,
+    pub proxy_port: Option<u16>,
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+}
+
+/// Non-fatal problems found while resolving, reported to the user.
+pub type Warnings = Vec<String>;
+
+pub fn resolve(
+    host: &Host,
+    req: &Request,
+) -> Result<(Profile, Warnings), String> {
+    let mut warnings = Warnings::new();
+    let s = req.settings;
+    let home = &host.home;
+    let keychain = s.keychain.unwrap_or(true);
+    let agent_state = s.agent_state.unwrap_or(true);
+
+    let network = match s.network_mode()? {
+        NetworkMode::Full => Network::Full,
+        NetworkMode::None => Network::None,
+        NetworkMode::Filtered => match req.proxy_port {
+            Some(port) => Network::Proxy(port),
+            None => Network::None,
+        },
+    };
+
+    // --- reads -----------------------------------------------------------
+    let mut system = Vec::new();
+    for path in SYSTEM_READ {
+        let path = Path::new(path);
+        if exists(path) {
+            system.push(rule_for(path));
+        }
+    }
+    if let Some(bundle) = xcode_bundle() {
+        system.push(Rule::subpath(bundle));
+    }
+
+    let mut toolchains = Vec::new();
+    for rel in HOME_TOOLCHAINS {
+        let path = home.join(rel);
+        if exists(&path) {
+            toolchains.push(rule_for(&path));
+        }
+    }
+    let mut path_entries = Vec::new();
+    for entry in &host.path {
+        if entry.is_absolute()
+            && entry.starts_with(home)
+            && entry.is_dir()
+            && !is_secret(home, entry)
+        {
+            path_entries.push(rule_for(entry));
+        }
+    }
+    let mut program = Vec::new();
+    if let Some(raw) = req.program {
+        // The resolved binary's directory (an npm package, a versioned
+        // install) and the PATH entry itself, which may be a symlink node.
+        if let Ok(real) = std::fs::canonicalize(raw)
+            && let Some(dir) = real.parent()
+            && !is_secret(home, dir)
+            && dir != home
+        {
+            program.push(Rule::subpath(dir));
+        }
+        if let (Some(parent), Some(name)) = (raw.parent(), raw.file_name()) {
+            program.push(Rule::literal(canon(parent).join(name)));
+        }
+    }
+
+    let agent_paths = match req.agent {
+        Some(agent) => agent.paths(home, req.env),
+        None => Default::default(),
+    };
+    let mut install = Vec::new();
+    for path in &agent_paths.install {
+        if exists(path) {
+            install.push(rule_for(path));
+        }
+    }
+
+    let mut extra_ro = Vec::new();
+    for raw in &s.ro {
+        let path = expand_home(raw, home);
+        if exists(&path) {
+            extra_ro.push(rule_for(&path));
+        } else {
+            warnings.push(format!("--ro {raw}: path does not exist, skipped"));
+        }
+    }
+
+    let mut ssh = Vec::new();
+    let mut unix_sockets = Vec::new();
+    let mut unix_binds = Vec::new();
+    if s.ssh_agent.unwrap_or(false) {
+        match &host.ssh_auth_sock {
+            Some(sock) if exists(sock) => {
+                unix_sockets.push(Rule::literal(canon(sock)));
+            }
+            _ => warnings.push(
+                "--ssh-agent: SSH_AUTH_SOCK is not set or missing".into(),
+            ),
+        }
+        for rel in [".ssh/known_hosts", ".ssh/config"] {
+            let path = home.join(rel);
+            if path.is_file() {
+                ssh.push(Rule::literal(canon(&path)));
+            }
+        }
+    }
+    for raw in &s.unix_sockets {
+        let path = expand_home(raw, home);
+        if exists(&path) {
+            unix_sockets.push(Rule::literal(canon(&path)));
+        } else {
+            warnings.push(format!(
+                "--unix-socket {raw}: socket does not exist, skipped"
+            ));
+        }
+    }
+
+    // --- writes ----------------------------------------------------------
+    let mut project_rules = vec![Rule::subpath(req.project)];
+    if let Some(gitdir) = linked_worktree_gitdir(req.project) {
+        project_rules.push(Rule::subpath(gitdir));
+    }
+
+    let mut state = Vec::new();
+    if agent_state {
+        for path in &agent_paths.state {
+            if exists(path) {
+                state.push(rule_for(path));
+            }
+        }
+        if req.agent == Some(Agent::Claude) {
+            // ~/.claude.json is replaced atomically through siblings such
+            // as .claude.json.tmp.<pid>.<ts>, .lock and .backup.
+            state.push(Rule::Regex(format!(
+                "^{}/\\.claude\\.json(\\.[^/]*)?$",
+                regex_escape(&home.to_string_lossy())
+            )));
+        }
+    }
+
+    let mut caches = Vec::new();
+    for rel in HOME_CACHES {
+        let path = home.join(rel);
+        if exists(&path) || matches!(*rel, ".cache" | ".npm" | "Library/Caches")
+        {
+            caches.push(Rule::subpath(canon(&path)));
+        }
+    }
+
+    let mut temp = Vec::new();
+    if let Some(dir) = &host.session_dir {
+        temp.push(Rule::subpath(dir));
+    }
+    match req.agent {
+        Some(Agent::Claude) => {
+            // Claude Code ignores TMPDIR for its per-user scratch dir and
+            // drops /tmp/claude-<hex>-cwd markers on every Bash call.
+            temp.push(Rule::subpath(format!(
+                "/private/tmp/claude-{}",
+                host.uid
+            )));
+            temp.push(Rule::Regex(
+                "^/private/tmp/claude-[0-9a-f]+-cwd$".into(),
+            ));
+        }
+        Some(Agent::Codex) => {
+            let daemon = format!("/private/tmp/codex-daemon-{}", host.uid);
+            temp.push(Rule::subpath(&daemon));
+            let socket = Rule::Regex(format!("^{daemon}/[0-9a-f]+$"));
+            unix_sockets.push(socket.clone());
+            unix_binds.push(socket);
+            if agent_state && let Some(codex_home) = agent_paths.state.first() {
+                let control = codex_home
+                    .join("app-server-control/app-server-control.sock");
+                unix_sockets.push(Rule::literal(canon(&control)));
+            }
+        }
+        _ => {}
+    }
+
+    let mut keychain_rw = Vec::new();
+    let mut keychain_ro = Vec::new();
+    if keychain {
+        keychain_rw.push(Rule::subpath(canon(&home.join("Library/Keychains"))));
+        if let Some(cache) = &host.user_cache_dir {
+            keychain_rw.push(Rule::subpath(cache.join("mds")));
+        }
+        keychain_ro.push(Rule::subpath("/private/var/db/mds"));
+        let prefs = home.join("Library/Preferences/com.apple.security.plist");
+        keychain_ro.push(Rule::literal(canon(&prefs)));
+    }
+
+    let mut extra_rw = Vec::new();
+    for raw in &s.rw {
+        let path = expand_home(raw, home);
+        if exists(&path) {
+            extra_rw.push(rule_for(&path));
+        } else {
+            warnings.push(format!("--rw {raw}: path does not exist, skipped"));
+        }
+    }
+
+    // --- denies ----------------------------------------------------------
+    let explicit_grants: Vec<PathBuf> = extra_ro
+        .iter()
+        .chain(&extra_rw)
+        .chain(&ssh)
+        .filter_map(rule_path)
+        .collect();
+    let mut secrets = Vec::new();
+    for rel in HOME_SECRETS {
+        let path = canon(&home.join(rel));
+        // An explicit grant of the secret itself (or something inside it)
+        // is the user's call; a broader grant such as `--ro ~` is not.
+        let granted = explicit_grants.iter().any(|g| g.starts_with(&path));
+        if exists(&path) && !granted {
+            secrets.push(rule_for(&path));
+        }
+    }
+
+    let mut hidden_project = Vec::new();
+    let mut reallow = Vec::new();
+    let project_re = regex_escape(&req.project.to_string_lossy());
+    let mut patterns: Vec<&str> = s.hide.iter().map(String::as_str).collect();
+    if s.default_hide.unwrap_or(true) {
+        patterns.extend(DEFAULT_HIDE);
+        reallow.push(Rule::Regex(format!(
+            "^{project_re}/(.*/)?\\.env\\.({})$",
+            DEFAULT_HIDE_EXCEPTIONS.join("|")
+        )));
+    }
+    for pattern in patterns {
+        hidden_project
+            .push(Rule::Regex(project_glob_regex(&project_re, pattern)?));
+    }
+
+    let mut denied = Vec::new();
+    for raw in &s.deny {
+        let path = expand_home(raw, home);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            req.project.join(path)
+        };
+        denied.push(match std::fs::canonicalize(&path) {
+            Ok(real) => rule_for(&real),
+            Err(_) => Rule::subpath(path),
+        });
+    }
+
+    let mut protected = Vec::new();
+    for path in &agent_paths.write_protected {
+        protected.push(Rule::subpath(canon(path)));
+    }
+    for path in &agent_paths.install {
+        protected.push(Rule::subpath(canon(path)));
+    }
+    if !s.git_hooks.unwrap_or(false) {
+        // Hooks and config (core.hooksPath, core.fsmonitor) run on the host
+        // the next time git is used outside the jail.
+        protected.push(Rule::subpath(req.project.join(".git/hooks")));
+        protected.push(Rule::Regex(format!(
+            "^{project_re}/\\.git/config(\\.lock)?$"
+        )));
+    }
+    protected.push(Rule::subpath(canon(&home.join(".config/mac-agent-jail"))));
+
+    // --- mach, shm -------------------------------------------------------
+    let mut mach = vec![Section {
+        comment: "System services every program needs",
+        items: strings(BASE_MACH_SERVICES),
+    }];
+    if keychain {
+        mach.push(Section {
+            comment: "macOS Keychain",
+            items: strings(KEYCHAIN_MACH_SERVICES),
+        });
+    }
+    if s.open_urls.unwrap_or(false) {
+        mach.push(Section {
+            comment: "Open URLs in the host browser (--open-urls)",
+            items: strings(OPEN_URL_MACH_SERVICES),
+        });
+    }
+    if s.clipboard.unwrap_or(false) {
+        mach.push(Section {
+            comment: "Pasteboard (--clipboard)",
+            items: strings(CLIPBOARD_MACH_SERVICES),
+        });
+    }
+    if !s.mach_services.is_empty() {
+        mach.push(Section {
+            comment: "User-listed services (--mach-service)",
+            items: s.mach_services.clone(),
+        });
+    }
+
+    let mut shm = vec![
+        (format!("apple.cfprefs.{}v1", host.uid), true),
+        ("apple.cfprefs.daemonv1".to_string(), true),
+        ("apple.shm.notification_center".to_string(), false),
+    ];
+    if keychain {
+        shm.push(("com.apple.AppleDatabaseChanged".to_string(), true));
+    }
+
+    let mut exe = Vec::new();
+    if req.agent == Some(Agent::Codex)
+        && let Some(path) = &host.exe
+    {
+        exe.push(Rule::literal(path));
+    }
+
+    let read = vec![
+        section("System", system),
+        section("Developer toolchains (read-only)", toolchains),
+        section("PATH entries under $HOME", path_entries),
+        section("The command being run", program),
+        section("Agent installation (read-only)", install),
+        section("Keychain support files", keychain_ro),
+        section("SSH client config (--ssh-agent)", ssh),
+        section("Codex ps helper", exe),
+        section("Extra read-only paths (--ro)", extra_ro),
+    ];
+    let write = vec![
+        section("Project", project_rules),
+        section("Agent state", state),
+        section("Package caches", caches),
+        section("Temporary files", temp),
+        section("Keychain databases", keychain_rw),
+        section("Extra read-write paths (--rw)", extra_rw),
+    ];
+
+    let metadata = {
+        let paths: Vec<PathBuf> = read
+            .iter()
+            .chain(&write)
+            .flat_map(|section| section.items.iter())
+            .filter_map(rule_path)
+            .collect();
+        let mut dirs = ancestors(paths.iter().map(PathBuf::as_path));
+        let fixed = SYSTEM_METADATA.iter().map(PathBuf::from);
+        for path in fixed.chain([home.clone()]) {
+            if !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+        dirs
+    };
+
+    let profile = Profile {
+        mach_services: mach,
+        shm,
+        network,
+        unix_sockets,
+        unix_binds,
+        tty: req.tty.map(Path::to_path_buf),
+        metadata,
+        read,
+        write,
+        hidden: vec![
+            section("Credential stores", secrets),
+            section("Hidden project files (--hide)", hidden_project),
+        ],
+        reallow,
+        denied: vec![section("Denied paths (--deny)", denied)],
+        deny_write: vec![section("Write-protected paths", protected)],
+    };
+    Ok((profile, warnings))
+}
+
+/// Translate a hide pattern into a regex anchored at the project. A pattern
+/// without '/' matches a basename at any depth; one with '/' is relative to
+/// the project root. `*` and `?` do not cross '/'.
+fn project_glob_regex(
+    project_re: &str,
+    pattern: &str,
+) -> Result<String, String> {
+    let trimmed = pattern.trim_start_matches("./").trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.split('/').any(|part| part == "..") {
+        return Err(format!("invalid hide pattern '{pattern}'"));
+    }
+    let mut body = String::new();
+    for c in trimmed.chars() {
+        match c {
+            '*' => body.push_str("[^/]*"),
+            '?' => body.push_str("[^/]"),
+            other => body.push_str(&regex_escape(&other.to_string())),
+        }
+    }
+    let anchored = trimmed.contains('/') || pattern.starts_with("./");
+    let prefix = if anchored { "" } else { "(.*/)?" };
+    Ok(format!("^{project_re}/{prefix}{body}(/.*)?$"))
+}
+
+/// The per-worktree git dir of a linked worktree, when the project's `.git`
+/// is a `gitdir:` file. Commits also write the shared object store, so the
+/// common dir (two levels up from `.git/worktrees/<name>`) is included.
+fn linked_worktree_gitdir(project: &Path) -> Option<PathBuf> {
+    let dotgit = project.join(".git");
+    if !dotgit.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir: "))?;
+    let gitdir = project.join(gitdir.trim());
+    let gitdir = std::fs::canonicalize(gitdir).ok()?;
+    let common = gitdir.parent()?.parent()?;
+    (common.file_name()? == ".git" || common.join("objects").is_dir())
+        .then(|| common.to_path_buf())
+}
+
+fn xcode_bundle() -> Option<PathBuf> {
+    let target =
+        std::fs::read_link("/private/var/db/xcode_select_link").ok()?;
+    let mut bundle = PathBuf::new();
+    for part in target.components() {
+        bundle.push(part);
+        if part.as_os_str().to_string_lossy().ends_with(".app") {
+            return Some(canon(&bundle));
+        }
+    }
+    None
+}
+
+fn is_secret(home: &Path, path: &Path) -> bool {
+    HOME_SECRETS
+        .iter()
+        .any(|rel| path.starts_with(home.join(rel)))
+}
+
+fn section(comment: &'static str, items: Vec<Rule>) -> Section<Rule> {
+    let mut unique: Vec<Rule> = Vec::with_capacity(items.len());
+    for item in items {
+        if !unique.contains(&item) {
+            unique.push(item);
+        }
+    }
+    Section {
+        comment,
+        items: unique,
+    }
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+fn rule_path(rule: &Rule) -> Option<PathBuf> {
+    match rule {
+        Rule::Path(path, _) => Some(path.clone()),
+        Rule::Regex(_) => None,
+    }
+}
+
+fn exists(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
+pub fn canon(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// A canonical rule: files are literals, directories (and paths that do not
+/// exist yet) are subpaths.
+fn rule_for(path: &Path) -> Rule {
+    let real = canon(path);
+    let kind = if real.is_file() {
+        Match::Literal
+    } else {
+        Match::Subpath
+    };
+    Rule::Path(real, kind)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::render;
+
+    struct Fixture {
+        root: PathBuf,
+        host: Host,
+        project: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Fixture {
+            let root = std::env::temp_dir()
+                .join(format!("maj-policy-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let home = root.join("home");
+            let project = home.join("work/app");
+            for dir in [
+                "work/app/.git",
+                ".claude",
+                ".codex",
+                ".cursor/extensions",
+                ".ssh",
+                ".aws",
+                ".local/bin",
+                ".local/share/claude/versions",
+                ".nvm/versions/node/v22/bin",
+                "Library/Keychains",
+            ] {
+                std::fs::create_dir_all(home.join(dir)).unwrap();
+            }
+            std::fs::write(home.join(".claude.json"), "{}").unwrap();
+            std::fs::write(home.join(".gitconfig"), "").unwrap();
+            std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
+            std::fs::write(home.join(".ssh/known_hosts"), "").unwrap();
+            let home = std::fs::canonicalize(home).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
+            let host = Host {
+                home: home.clone(),
+                uid: 501,
+                user_cache_dir: Some(PathBuf::from("/private/var/folders/x/C")),
+                session_dir: Some(PathBuf::from("/private/var/folders/x/T/s")),
+                exe: Some(PathBuf::from("/opt/maj/bin/mac-agent-jail")),
+                path: vec![
+                    home.join(".nvm/versions/node/v22/bin"),
+                    home.join(".ssh"),
+                    PathBuf::from("/opt/homebrew/bin"),
+                ],
+                ssh_auth_sock: None,
+            };
+            Fixture {
+                root,
+                host,
+                project,
+            }
+        }
+
+        fn render(&self, settings: &Settings, agent: Option<Agent>) -> String {
+            let no_env = |_: &str| None;
+            let req = Request {
+                settings,
+                agent,
+                project: &self.project,
+                program: None,
+                tty: None,
+                proxy_port: Some(18080),
+                env: &no_env,
+            };
+            let (profile, _) = resolve(&self.host, &req).unwrap();
+            render(&profile)
+        }
+
+        fn home(&self) -> String {
+            self.host.home.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn keychain_is_allowed_by_default_for_every_agent() {
+        let fx = Fixture::new("keychain");
+        for agent in [
+            None,
+            Some(Agent::Claude),
+            Some(Agent::Codex),
+            Some(Agent::Cursor),
+        ] {
+            let text = fx.render(&Settings::default(), agent);
+            for service in [
+                "com.apple.SecurityServer",
+                "com.apple.securityd.xpc",
+                "com.apple.CoreAuthentication.daemon",
+            ] {
+                assert!(
+                    text.contains(&format!("(global-name \"{service}\")")),
+                    "{agent:?} missing {service}"
+                );
+            }
+            assert!(text.contains(&format!(
+                "(allow file-read* file-write* (subpath \"{}/Library/Keychains\"))",
+                fx.home()
+            )));
+            assert!(text.contains("com.apple.AppleDatabaseChanged"));
+            assert!(
+                text.contains("(subpath \"/private/var/folders/x/C/mds\")")
+            );
+        }
+    }
+
+    #[test]
+    fn no_keychain_removes_every_keychain_grant() {
+        let fx = Fixture::new("no-keychain");
+        let settings = Settings {
+            keychain: Some(false),
+            ..Settings::default()
+        };
+        let text = fx.render(&settings, Some(Agent::Claude));
+        assert!(!text.contains("SecurityServer"));
+        assert!(!text.contains("securityd"));
+        assert!(!text.contains("Library/Keychains"));
+        assert!(!text.contains("AppleDatabaseChanged"));
+        assert!(!text.contains("/mds"));
+    }
+
+    #[test]
+    fn project_is_writable_and_home_is_not() {
+        let fx = Fixture::new("project");
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))",
+            fx.project.display()
+        )));
+        assert!(!text.contains(&format!("(subpath \"{}\")", fx.home())));
+        assert!(text.contains(&format!(
+            "(allow file-read-metadata (literal \"{}\"))",
+            fx.home()
+        )));
+    }
+
+    #[test]
+    fn agent_state_is_per_agent() {
+        let fx = Fixture::new("state");
+        let home = fx.home();
+        let claude = fx.render(&Settings::default(), Some(Agent::Claude));
+        assert!(claude.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{home}/.claude\"))"
+        )));
+        assert!(claude.contains("\\.claude\\.json(\\.[^/]*)?$"));
+        assert!(claude.contains("/private/tmp/claude-501"));
+        assert!(claude.contains(&format!(
+            "(allow file-read* (subpath \"{home}/.local/share/claude\"))"
+        )));
+        assert!(claude.contains(&format!(
+            "(deny file-write* (subpath \"{home}/.local/share/claude\"))"
+        )));
+        assert!(!claude.contains(&format!("{home}/.codex")));
+
+        let codex = fx.render(&Settings::default(), Some(Agent::Codex));
+        assert!(codex.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{home}/.codex\"))"
+        )));
+        assert!(codex.contains("codex-daemon-501"));
+        assert!(codex.contains("(literal \"/opt/maj/bin/mac-agent-jail\")"));
+        assert!(!codex.contains(&format!("{home}/.claude\"")));
+
+        let cursor = fx.render(&Settings::default(), Some(Agent::Cursor));
+        assert!(cursor.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{home}/.cursor\"))"
+        )));
+        assert!(cursor.contains(&format!(
+            "(deny file-write* (subpath \"{home}/.cursor/extensions\"))"
+        )));
+
+        let none = Settings {
+            agent_state: Some(false),
+            ..Settings::default()
+        };
+        let text = fx.render(&none, Some(Agent::Claude));
+        assert!(!text.contains(&format!("{home}/.claude\"")));
+    }
+
+    #[test]
+    fn secrets_stay_hidden_and_path_entries_inside_them_are_skipped() {
+        let fx = Fixture::new("secrets");
+        let home = fx.home();
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&format!(
+            "(deny file-read* file-write* (subpath \"{home}/.ssh\"))"
+        )));
+        assert!(!text.contains(&format!(
+            "(allow file-read* (subpath \"{home}/.ssh\"))"
+        )));
+        assert!(text.contains(&format!(
+            "(allow file-read* (subpath \"{home}/.nvm/versions/node/v22/bin\"))"
+        )));
+        assert!(text.contains(&format!(
+            "(allow file-read* (literal \"{home}/.gitconfig\"))"
+        )));
+    }
+
+    #[test]
+    fn broad_grants_do_not_expose_secrets_but_explicit_ones_do() {
+        let fx = Fixture::new("grants");
+        let home = fx.home();
+        let broad = Settings {
+            ro: vec!["~".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&broad, None);
+        let allow =
+            text.find(&format!("(allow file-read* (subpath \"{home}\"))"));
+        let deny = text.find(&format!(
+            "(deny file-read* file-write* (subpath \"{home}/.aws\"))"
+        ));
+        assert!(allow.is_some() && deny.is_some() && allow < deny);
+
+        let explicit = Settings {
+            ro: vec!["~/.aws".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&explicit, None);
+        assert!(!text.contains(&format!(
+            "(deny file-read* file-write* (subpath \"{home}/.aws\"))"
+        )));
+    }
+
+    #[test]
+    fn ssh_agent_exposes_known_hosts_but_not_keys() {
+        let mut fx = Fixture::new("ssh");
+        let sock = fx.root.join("agent.sock");
+        std::fs::write(&sock, "").unwrap();
+        fx.host.ssh_auth_sock = Some(sock.clone());
+        let settings = Settings {
+            ssh_agent: Some(true),
+            ..Settings::default()
+        };
+        let text = fx.render(&settings, None);
+        let home = fx.home();
+        assert!(text.contains(&format!(
+            "(allow file-read* (literal \"{home}/.ssh/known_hosts\"))"
+        )));
+        assert!(!text.contains(&format!("(subpath \"{home}/.ssh\")")));
+        assert!(!text.contains("id_ed25519"));
+        assert!(text.contains(&format!(
+            "(path-literal \"{}\")",
+            canon(&sock).display()
+        )));
+    }
+
+    #[test]
+    fn env_files_are_hidden_with_example_exceptions() {
+        let fx = Fixture::new("hide");
+        let project = regex_escape(&fx.project.to_string_lossy());
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&format!(
+            "(deny file-read* file-write* (regex #\"^{project}/(.*/)?\\.env(/.*)?$\"))"
+        )));
+        assert!(text.contains(&format!(
+            "(regex #\"^{project}/(.*/)?\\.env\\.[^/]*(/.*)?$\")"
+        )));
+        let hidden = text.find("Hidden project files").unwrap();
+        let reallow = text
+            .find("\\.env\\.(example|sample|template|dist)$")
+            .unwrap();
+        assert!(hidden < reallow);
+
+        let off = Settings {
+            default_hide: Some(false),
+            hide: vec!["config/*.pem".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&off, None);
+        assert!(!text.contains("\\.env"));
+        assert!(
+            text.contains(&format!("^{project}/config/[^/]*\\.pem(/.*)?$"))
+        );
+    }
+
+    #[test]
+    fn user_denies_render_after_env_exceptions() {
+        let fx = Fixture::new("deny");
+        let settings = Settings {
+            deny: vec!["secrets".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&settings, None);
+        let reallow = text.find("Exceptions to the denies").unwrap();
+        let deny = text
+            .find(&format!(
+                "(deny file-read* file-write* (subpath \"{}/secrets\"))",
+                fx.project.display()
+            ))
+            .unwrap();
+        assert!(reallow < deny);
+    }
+
+    #[test]
+    fn git_hooks_are_write_protected_by_default() {
+        let fx = Fixture::new("git");
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath \"{}/.git/hooks\"))",
+            fx.project.display()
+        )));
+        assert!(text.contains("/\\.git/config(\\.lock)?$"));
+        let allowed = Settings {
+            git_hooks: Some(true),
+            ..Settings::default()
+        };
+        assert!(!fx.render(&allowed, None).contains(".git/hooks"));
+    }
+
+    #[test]
+    fn network_modes() {
+        let fx = Fixture::new("net");
+        let full = fx.render(&Settings::default(), None);
+        assert!(full.contains("(remote ip \"*:*\")"));
+        let filtered = Settings {
+            allow_hosts: vec!["github.com".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&filtered, None);
+        assert!(text.contains("(remote ip \"localhost:18080\")"));
+        assert!(!text.contains("*:*"));
+        let none = Settings {
+            network: Some("none".into()),
+            ..Settings::default()
+        };
+        let text = fx.render(&none, None);
+        assert!(!text.contains("(remote ip"));
+    }
+
+    #[test]
+    fn optional_capabilities_are_off_by_default() {
+        let fx = Fixture::new("caps");
+        let text = fx.render(&Settings::default(), None);
+        assert!(!text.contains("launchservicesd"));
+        assert!(!text.contains("pasteboard"));
+        let on = Settings {
+            open_urls: Some(true),
+            clipboard: Some(true),
+            mach_services: vec!["com.example.helper".into()],
+            ..Settings::default()
+        };
+        let text = fx.render(&on, None);
+        assert!(text.contains("com.apple.coreservices.launchservicesd"));
+        assert!(text.contains("com.apple.pasteboard.1"));
+        assert!(text.contains("com.example.helper"));
+    }
+
+    #[test]
+    fn hide_pattern_validation() {
+        assert!(project_glob_regex("/p", "../x").is_err());
+        assert!(project_glob_regex("/p", "").is_err());
+        assert_eq!(
+            project_glob_regex("/p", "*.pem").unwrap(),
+            "^/p/(.*/)?[^/]*\\.pem(/.*)?$"
+        );
+        assert_eq!(
+            project_glob_regex("/p", "./secrets/").unwrap(),
+            "^/p/secrets(/.*)?$"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_metadata_is_writable() {
+        let fx = Fixture::new("worktree");
+        let main = fx.root.join("main");
+        let gitdir = main.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let wt = fx.root.join("feature");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let common = linked_worktree_gitdir(&wt).unwrap();
+        assert_eq!(common, canon(&main.join(".git")));
+        assert!(linked_worktree_gitdir(&fx.project).is_none());
+    }
+}
