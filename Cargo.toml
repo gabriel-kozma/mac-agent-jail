@@ -1,0 +1,20 @@
+[package]
+name = "mac-agent-jail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "macOS Seatbelt sandbox for AI coding agents (Claude Code, Codex, Cursor CLI) with Keychain access"
+license = "GPL-3.0-only"
+repository = "https://github.com/gabriel-kozma/mac-agent-jail"
+readme = "README.md"
+keywords = ["sandbox", "macos", "seatbelt", "ai", "keychain"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+strip = true
+lto = true
