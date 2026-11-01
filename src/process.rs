@@ -75,13 +75,17 @@ impl Pty {
                 ws_ypixel: 0,
             });
         // SAFETY: valid out-pointers; the terminal settings are inherited.
+        // The window size is only read. Linux declares that argument
+        // `*const winsize` and macOS declares it `*mut winsize`; a mutable
+        // pointer satisfies both, while `&mut` fails Linux clippy.
+        let size_ptr: *mut libc::winsize = &mut size;
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                size_ptr,
             )
         };
         if rc != 0 {
