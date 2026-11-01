@@ -9,8 +9,10 @@ macOS-only and tuned for these three agents. Like ai-jail, it is an
 accident-prevention layer for "YOLO mode" agents, not a boundary against
 hostile code (use a VM for that).
 
-> Status: work in progress. Unit tests pass on Linux. The generated profile has
-> not yet been run against a real `sandbox-exec` on macOS.
+> Status: the generated profile runs under real `sandbox-exec` on macOS.
+> `cargo test` there includes live checks for the filesystem policy, Keychain,
+> network modes, and the `/usr/bin/git` toolchain shims. The same unit tests
+> pass on Linux.
 
 ## Usage
 
