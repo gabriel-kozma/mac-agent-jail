@@ -10,9 +10,8 @@ accident-prevention layer for "YOLO mode" agents, not a boundary against
 hostile code (use a VM for that).
 
 > Status: the generated profile runs under real `sandbox-exec` on macOS.
-> `cargo test` there includes live checks for the filesystem policy, Keychain,
-> network modes, and the `/usr/bin/git` toolchain shims. The same unit tests
-> pass on Linux.
+> `cargo test` includes live checks for the filesystem policy, Keychain,
+> network modes, and the `/usr/bin/git` toolchain shims.
 
 ## Usage
 
