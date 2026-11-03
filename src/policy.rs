@@ -13,6 +13,12 @@ use crate::{
 /// System locations needed to exec ordinary programs and load their
 /// libraries. `/opt` holds Homebrew on Apple Silicon; `/usr/local` (under
 /// `/usr`) holds it on Intel.
+///
+/// `/private/var/select` has to be readable, not merely `stat`-able.
+/// `/usr/bin/git` and `/usr/bin/python3` are shims that `readlink`
+/// `developer_dir` there, and Seatbelt treats `readlink` as
+/// `file-read-data`. Metadata on the parent denies them with
+/// "unable to read data link".
 const SYSTEM_READ: &[&str] = &[
     "/System",
     "/usr",
@@ -24,7 +30,7 @@ const SYSTEM_READ: &[&str] = &[
     "/dev",
     "/nix",
     "/private/var/db/timezone",
-    "/private/var/select/sh",
+    "/private/var/select",
     "/private/var/db/xcode_select_link",
 ];
 
@@ -219,7 +225,9 @@ pub fn resolve(
     for path in SYSTEM_READ {
         let path = Path::new(path);
         if exists(path) {
-            system.push(rule_for(path));
+            // A symlink contributes its own node, so readlink works, and
+            // the canonical target. rule_for alone would drop the link.
+            system.extend(read_rules(path));
         }
     }
     if let Some(bundle) = xcode_bundle() {
@@ -345,6 +353,16 @@ pub fn resolve(
     let mut temp = Vec::new();
     if let Some(dir) = &host.session_dir {
         temp.push(Rule::subpath(dir));
+        // /usr/bin/git, clang and python3 go through xcrun, which ignores
+        // TMPDIR and creates xcrun_db-* in the per-user temporary directory
+        // (confstr DARWIN_USER_TEMP_DIR). The rest of that directory stays
+        // hidden: other processes keep files there.
+        if let Some(root) = dir.parent().filter(|p| p.parent().is_some()) {
+            temp.push(Rule::Regex(format!(
+                "^{}/xcrun_db(-[^/]*)?$",
+                regex_escape(&root.to_string_lossy())
+            )));
+        }
     }
     match req.agent {
         Some(Agent::Claude) => {
@@ -657,7 +675,8 @@ pub fn canon(path: &Path) -> PathBuf {
 }
 
 /// A canonical rule: files are literals, directories (and paths that do not
-/// exist yet) are subpaths.
+/// exist yet) are subpaths. Symlinks are followed; use [`read_rules`] when
+/// the link node itself must stay readable.
 fn rule_for(path: &Path) -> Rule {
     let real = canon(path);
     let kind = if real.is_file() {
@@ -666,6 +685,28 @@ fn rule_for(path: &Path) -> Rule {
         Match::Subpath
     };
     Rule::Path(real, kind)
+}
+
+/// Read rules for `path`. A symlink contributes its own node (so `readlink`
+/// works) and the canonical target.
+fn read_rules(path: &Path) -> Vec<Rule> {
+    let mut rules = Vec::new();
+    if let Some(link) = symlink_node(path) {
+        rules.push(Rule::literal(link));
+    }
+    rules.push(rule_for(path));
+    rules
+}
+
+/// The symlink itself, with its parent canonicalized, when `path` is a symlink.
+fn symlink_node(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    let name = path.file_name()?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    Some(canon(parent).join(name))
 }
 
 #[cfg(test)]
@@ -1036,6 +1077,30 @@ mod tests {
             project_glob_regex("/p", "./secrets/").unwrap(),
             "^/p/secrets(/.*)?$"
         );
+    }
+
+    #[test]
+    fn xcrun_cache_is_writable_next_to_the_session_dir() {
+        let fx = Fixture::new("xcrun");
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(
+            "(allow file-read* file-write* (regex #\"^/private/var/folders/x/T/xcrun_db(-[^/]*)?$\"))"
+        ));
+        assert!(!text.contains("(subpath \"/private/var/folders/x/T\")"));
+    }
+
+    #[test]
+    fn read_rules_keep_a_symlink_and_its_target() {
+        let root = std::env::temp_dir()
+            .join(format!("maj-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(root.join("real"), &link).unwrap();
+        let rules = read_rules(&link);
+        assert!(rules.contains(&Rule::literal(canon(&root).join("link"))));
+        assert!(rules.contains(&Rule::subpath(canon(&root.join("real")))));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
