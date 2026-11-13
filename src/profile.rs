@@ -44,9 +44,20 @@ impl Rule {
     }
 }
 
+/// Loopback destinations reachable in full network mode. Services
+/// listening there (dev servers, debug ports, Docker's TCP API) are host
+/// processes outside the jail, like the Unix sockets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Loopback {
+    All,
+    /// Only these ports.
+    Ports(Vec<u16>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Network {
-    Full,
+    /// Any IP destination, with loopback limited as given.
+    Full(Loopback),
     /// Only the filtered-egress proxy on this loopback port.
     Proxy(u16),
     None,
@@ -83,6 +94,9 @@ pub struct Profile {
     /// deny always wins.
     pub denied: Vec<Section<Rule>>,
     pub deny_write: Vec<Section<Rule>>,
+    /// Exceptions to `deny_write`, writable again. Rendered before
+    /// `denied`, so an explicit deny still wins.
+    pub reallow_write: Vec<Section<Rule>>,
 }
 
 pub fn render(profile: &Profile) -> String {
@@ -148,6 +162,12 @@ pub fn render(profile: &Profile) -> String {
         "(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") \
          (literal \"/dev/random\") (literal \"/dev/urandom\"))\n",
     );
+    // Aliases of descriptors the process already holds; scripts redirect
+    // to them (`echo oops >/dev/stderr`).
+    out.push_str(
+        "(allow file-write* (literal \"/dev/stdout\") \
+         (literal \"/dev/stderr\") (subpath \"/dev/fd\"))\n",
+    );
     out.push_str(
         "(allow file-read* file-write* file-ioctl \
          (literal \"/dev/dtracehelper\"))\n\n",
@@ -178,17 +198,29 @@ pub fn render(profile: &Profile) -> String {
         }
         out.push('\n');
     }
-    render_rules(&mut out, "deny file-read* file-write*", &profile.denied);
     render_rules(&mut out, "deny file-write*", &profile.deny_write);
+    render_rules(&mut out, "allow file-write*", &profile.reallow_write);
+    render_rules(&mut out, "deny file-read* file-write*", &profile.denied);
     out
 }
 
 fn render_network(out: &mut String, profile: &Profile) {
-    match profile.network {
-        Network::Full => {
+    match &profile.network {
+        Network::Full(loopback) => {
             out.push_str("; Network: any IP destination\n");
             out.push_str("(allow system-socket)\n");
             out.push_str("(allow network-outbound (remote ip \"*:*\"))\n");
+            if let Loopback::Ports(ports) = loopback {
+                out.push_str(
+                    "(deny network-outbound (remote ip \"localhost:*\"))\n",
+                );
+                for port in ports {
+                    out.push_str(&format!(
+                        "(allow network-outbound \
+                         (remote ip \"localhost:{port}\"))\n"
+                    ));
+                }
+            }
             out.push_str("(allow network-inbound (local ip \"*:*\"))\n");
             out.push_str("(allow network-bind (local ip \"*:*\"))\n");
             // DNS on macOS goes through mDNSResponder's Unix socket. Other
@@ -332,6 +364,7 @@ mod tests {
             reallow: Vec::new(),
             denied: Vec::new(),
             deny_write: Vec::new(),
+            reallow_write: Vec::new(),
         }
     }
 
@@ -367,11 +400,25 @@ mod tests {
     #[test]
     fn full_network_excludes_arbitrary_unix_sockets() {
         let mut profile = empty();
-        profile.network = Network::Full;
+        profile.network = Network::Full(Loopback::All);
         let text = render(&profile);
         assert!(text.contains("(remote ip \"*:*\")"));
         assert!(text.contains("/private/var/run/mDNSResponder"));
         assert!(!text.contains("(allow network-outbound)\n"));
+        assert!(!text.contains("localhost"));
+    }
+
+    #[test]
+    fn full_network_closes_loopback_except_listed_ports() {
+        let mut profile = empty();
+        profile.network = Network::Full(Loopback::Ports(vec![3000]));
+        let text = render(&profile);
+        let any = text.find("(allow network-outbound (remote ip \"*:*\"))");
+        let deny =
+            text.find("(deny network-outbound (remote ip \"localhost:*\"))");
+        let port = text
+            .find("(allow network-outbound (remote ip \"localhost:3000\"))");
+        assert!(any.is_some() && any < deny && deny < port, "{text}");
     }
 
     #[test]
@@ -402,6 +449,36 @@ mod tests {
         assert!(render(&profile).contains(
             "(allow file-read* file-write* file-ioctl (literal \"/dev/ttys042\"))"
         ));
+    }
+
+    #[test]
+    fn standard_stream_aliases_are_writable() {
+        let text = render(&empty());
+        assert!(text.contains(
+            "(allow file-write* (literal \"/dev/stdout\") \
+             (literal \"/dev/stderr\") (subpath \"/dev/fd\"))"
+        ));
+    }
+
+    #[test]
+    fn write_exceptions_render_between_protection_and_explicit_denies() {
+        let mut profile = empty();
+        let rule = |comment, path: &str| Section {
+            comment,
+            items: vec![Rule::subpath(path)],
+        };
+        profile.deny_write.push(rule("protected", "/p/a"));
+        profile.reallow_write.push(rule("exception", "/p/a/b"));
+        profile.denied.push(rule("denied", "/p/a/b/c"));
+        let text = render(&profile);
+        let protect = text.find("(deny file-write* (subpath \"/p/a\"))");
+        let exception = text.find("(allow file-write* (subpath \"/p/a/b\"))");
+        let denied =
+            text.find("(deny file-read* file-write* (subpath \"/p/a/b/c\"))");
+        assert!(
+            protect.is_some() && protect < exception && exception < denied,
+            "{text}"
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::Settings;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agent {
     Claude,
@@ -94,6 +96,17 @@ impl Agent {
         }
     }
 
+    /// Whether the agent keeps its login in the macOS Keychain. The
+    /// Keychain cannot be scoped to one item, so it is only opened by
+    /// default for agents that cannot start authenticated without it.
+    /// Codex keeps its login in `$CODEX_HOME/auth.json`.
+    pub fn uses_keychain(self) -> bool {
+        match self {
+            Agent::Claude | Agent::Cursor => true,
+            Agent::Codex => false,
+        }
+    }
+
     /// Hosts the agent needs for login and inference. Used as the default
     /// allow-list in filtered network mode; every entry also matches its
     /// subdomains.
@@ -118,12 +131,58 @@ impl Agent {
                 "CLAUDE_CONFIG_DIR",
                 "CLAUDE_CODE_USE_BEDROCK",
                 "CLAUDE_CODE_USE_VERTEX",
+                "AWS_REGION",
+                "CLOUD_ML_REGION",
+                "ANTHROPIC_VERTEX_PROJECT_ID",
             ],
             Agent::Codex => {
                 &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"]
             }
             Agent::Cursor => &["CURSOR_API_KEY"],
         }
+    }
+
+    /// A warning when the agent is routed to a cloud provider whose
+    /// credentials the jail hides. They are never shared implicitly: the
+    /// same credentials reach everything else in the account.
+    pub fn provider_warning(
+        self,
+        env: &dyn Fn(&str) -> Option<String>,
+        settings: &Settings,
+    ) -> Option<String> {
+        if self != Agent::Claude || settings.inherit_env.unwrap_or(false) {
+            return None;
+        }
+        let enabled = |key: &str| {
+            env(key).is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false"))
+        };
+        let shared = |prefix: &str, dir: &str| {
+            settings.env.iter().any(|entry| entry.starts_with(prefix))
+                || settings
+                    .ro
+                    .iter()
+                    .chain(&settings.rw)
+                    .any(|path| path.contains(dir))
+        };
+        if enabled("CLAUDE_CODE_USE_BEDROCK") && !shared("AWS_", ".aws") {
+            return Some(
+                "CLAUDE_CODE_USE_BEDROCK is set, but the jail hides AWS \
+                 credentials (~/.aws and AWS_* variables), so Claude cannot \
+                 authenticate. Share them explicitly, for example \
+                 --env AWS_PROFILE --ro ~/.aws"
+                    .into(),
+            );
+        }
+        if enabled("CLAUDE_CODE_USE_VERTEX") && !shared("GOOGLE_", "gcloud") {
+            return Some(
+                "CLAUDE_CODE_USE_VERTEX is set, but the jail hides Google \
+                 Cloud credentials (~/.config/gcloud and GOOGLE_* \
+                 variables), so Claude cannot authenticate. Share them \
+                 explicitly, for example --ro ~/.config/gcloud"
+                    .into(),
+            );
+        }
+        None
     }
 
     /// Fixed variables set for the agent inside the jail.
@@ -271,6 +330,41 @@ mod tests {
                 .write_protected
                 .contains(&home.join(".cursor/extensions"))
         );
+    }
+
+    #[test]
+    fn cloud_provider_routing_warns_until_credentials_are_shared() {
+        let bedrock = |key: &str| {
+            (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string())
+        };
+        let hidden = Settings::default();
+        let warning = Agent::Claude.provider_warning(&bedrock, &hidden);
+        assert!(warning.unwrap().contains("~/.aws"));
+        assert!(Agent::Codex.provider_warning(&bedrock, &hidden).is_none());
+        assert!(Agent::Claude.provider_warning(&no_env, &hidden).is_none());
+        for shared in [
+            Settings {
+                env: vec!["AWS_PROFILE".into()],
+                ..Settings::default()
+            },
+            Settings {
+                ro: vec!["~/.aws".into()],
+                ..Settings::default()
+            },
+            Settings {
+                inherit_env: Some(true),
+                ..Settings::default()
+            },
+        ] {
+            assert!(
+                Agent::Claude.provider_warning(&bedrock, &shared).is_none()
+            );
+        }
+        let vertex = |key: &str| {
+            (key == "CLAUDE_CODE_USE_VERTEX").then(|| "1".to_string())
+        };
+        let warning = Agent::Claude.provider_warning(&vertex, &hidden);
+        assert!(warning.unwrap().contains("gcloud"));
     }
 
     #[test]

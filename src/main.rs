@@ -112,6 +112,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         if let Some(message) = agent.nested_sandbox_warning(&user_args) {
             warn(&message);
         }
+        if let Some(message) = agent.provider_warning(&getenv, &settings) {
+            warn(&message);
+        }
         args.extend(agent.nested_sandbox_args(&user_args));
     }
     args.extend(settings.args.iter().cloned());
@@ -197,6 +200,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         user_cache_dir: darwin_dir(DarwinDir::Cache),
         session_dir: session_dir.clone(),
         exe: std::env::current_exe().ok().map(|p| policy::canon(&p)),
+        config: std::path::absolute(&config_path)
+            .ok()
+            .map(|p| policy::canon(&p)),
         path: host_path.clone(),
         ssh_auth_sock: getenv("SSH_AUTH_SOCK").map(PathBuf::from),
     };
@@ -238,7 +244,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             args: &args,
             network,
             allow: &allow,
-            keychain: settings.keychain.unwrap_or(true),
+            keychain: policy::keychain_enabled(&settings, agent),
             env: &child_env,
             profile: &profile_text,
         });

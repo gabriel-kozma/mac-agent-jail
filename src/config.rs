@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkMode {
-    /// Any TCP/UDP destination; Unix sockets stay closed unless listed.
+    /// Any TCP/UDP destination; Unix sockets and loopback stay closed
+    /// unless listed.
     Full,
     /// Only hosts on the allow-list, through a local CONNECT proxy.
     Filtered,
@@ -49,6 +50,8 @@ impl NetworkMode {
 pub struct Settings {
     pub network: Option<String>,
     pub allow_hosts: Vec<String>,
+    pub localhost: Option<bool>,
+    pub local_ports: Vec<u16>,
     pub keychain: Option<bool>,
     pub agent_state: Option<bool>,
     pub ssh_agent: Option<bool>,
@@ -75,6 +78,7 @@ impl Settings {
             }
         }
         scalar(&mut self.network, &other.network);
+        scalar(&mut self.localhost, &other.localhost);
         scalar(&mut self.keychain, &other.keychain);
         scalar(&mut self.agent_state, &other.agent_state);
         scalar(&mut self.ssh_agent, &other.ssh_agent);
@@ -84,6 +88,7 @@ impl Settings {
         scalar(&mut self.default_hide, &other.default_hide);
         scalar(&mut self.inherit_env, &other.inherit_env);
         self.allow_hosts.extend(other.allow_hosts.iter().cloned());
+        self.local_ports.extend(other.local_ports.iter().copied());
         self.ro.extend(other.ro.iter().cloned());
         self.rw.extend(other.rw.iter().cloned());
         self.deny.extend(other.deny.iter().cloned());
@@ -188,9 +193,15 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 # network = "full"
 # allow_hosts = ["github.com", "registry.npmjs.org"]
 
+# In "full" mode, loopback (127.0.0.1, ::1) stays closed: services there
+# are host processes outside the jail. Open single ports, or all of it.
+# local_ports = [3000, 5173]
+# localhost = false
+
 # macOS Keychain access (login keychain, Touch ID prompts). On by default
-# so agents that keep their login in the Keychain start authenticated.
-# keychain = true
+# only for agents that keep their login there (claude, cursor); the
+# Keychain also holds every other credential saved on this Mac.
+# keychain = false
 
 # Share the agent's own state dir (~/.claude, ~/.codex, ~/.cursor).
 # agent_state = true
@@ -199,7 +210,8 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 # ssh_agent = false   # forward $SSH_AUTH_SOCK (git over SSH)
 # open_urls = false   # let `open https://...` reach the host browser
 # clipboard = false   # pasteboard read/write (image paste)
-# git_hooks = false   # allow writing .git/hooks and .git/config
+# git_hooks = false   # allow writing .git/hooks and .git/config, and
+#                     # creating repositories (git clone, git init)
 
 # Extra paths ("~" is expanded).
 # ro = ["~/work/shared-libs"]
@@ -249,6 +261,7 @@ mod tests {
             [agents.codex]
             allow_hosts = ["pypi.org"]
             keychain = false
+            local_ports = [3000]
             args = ["--yolo"]
             "#,
         )
@@ -257,6 +270,7 @@ mod tests {
         assert_eq!(codex.allow_hosts, vec!["github.com", "pypi.org"]);
         assert_eq!(codex.keychain, Some(false));
         assert_eq!(codex.args, vec!["--yolo"]);
+        assert_eq!(codex.local_ports, vec![3000]);
         let claude = file.settings_for(Some("claude"));
         assert_eq!(claude.allow_hosts, vec!["github.com"]);
         assert_eq!(claude.keychain, Some(true));

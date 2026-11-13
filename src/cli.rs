@@ -14,14 +14,17 @@ USAGE:
     mac-agent-jail                 (a sandboxed zsh)
 
 The current directory is the project: readable and writable. The rest of
-your home is hidden except for the agent's own state, developer toolchains,
-and the macOS Keychain.
+your home is hidden except for the agent's own state and developer
+toolchains.
 
 NETWORK:
     --net MODE              full (default), filtered, or none
     --no-network            same as --net none
     --allow-host HOST       allow HOST and its subdomains (implies filtered);
                             the agent's own API hosts are always included
+    --local-port PORT       in full mode, allow connecting to a loopback
+                            port (repeatable); loopback is closed otherwise
+    --localhost             in full mode, allow all of loopback
 
 FILESYSTEM:
     --ro PATH               extra read-only path (repeatable)
@@ -29,11 +32,14 @@ FILESYSTEM:
     --deny PATH             deny reads and writes to PATH (repeatable)
     --hide GLOB             hide matching project files (repeatable)
     --no-default-hide       do not hide .env / .env.* in the project
-    --git-hooks             allow writing .git/hooks and .git/config
+    --git-hooks             allow writing .git/hooks and .git/config, and
+                            creating repositories (git clone, git init)
     --project DIR           project directory (default: current directory)
 
 HOST CAPABILITIES:
-    --no-keychain           block macOS Keychain access (on by default)
+    --keychain              allow macOS Keychain access
+    --no-keychain           block it (default: allowed for claude and
+                            cursor, which keep their login there)
     --no-agent-state        do not share ~/.claude, ~/.codex, ~/.cursor
     --ssh-agent             forward $SSH_AUTH_SOCK
     --unix-socket PATH      allow connecting to a Unix socket (repeatable)
@@ -124,6 +130,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--network" => s.network = Some("full".into()),
             "--no-network" => s.network = Some("none".into()),
             "--allow-host" => s.allow_hosts.push(value(&flag)?),
+            "--local-port" => {
+                let port = value(&flag)?;
+                s.local_ports.push(
+                    port.parse().map_err(|_| {
+                        format!("invalid --local-port '{port}'")
+                    })?,
+                );
+            }
+            "--localhost" => s.localhost = Some(true),
+            "--no-localhost" => s.localhost = Some(false),
             "--ro" => s.ro.push(value(&flag)?),
             "--rw" => s.rw.push(value(&flag)?),
             "--deny" => s.deny.push(value(&flag)?),
@@ -163,6 +179,7 @@ fn takes_value(flag: &str) -> bool {
             | "--net"
             | "--network"
             | "--allow-host"
+            | "--local-port"
             | "--ro"
             | "--rw"
             | "--deny"
@@ -236,6 +253,15 @@ mod tests {
             Some("full".into())
         );
         assert!(parse_args(&["--net", "sometimes"]).is_err());
+        let cli =
+            parse_args(&["--local-port", "3000", "--local-port=5173"]).unwrap();
+        assert_eq!(cli.settings.local_ports, vec![3000, 5173]);
+        assert_eq!(cli.settings.localhost, None);
+        assert_eq!(
+            parse_args(&["--localhost"]).unwrap().settings.localhost,
+            Some(true)
+        );
+        assert!(parse_args(&["--local-port", "http"]).is_err());
     }
 
     #[test]
