@@ -184,6 +184,8 @@ const BASE_MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd",
     "com.apple.trustd.agent",
+    // /usr/bin/curl verifies chains /etc/ssl/cert.pem cannot through it.
+    "com.apple.TrustEvaluationAgent",
     "com.apple.ocspd",
     "com.apple.FSEvents",
 ];
@@ -292,17 +294,18 @@ pub fn resolve(
     let agent_state = s.agent_state.unwrap_or(true);
 
     let network = match s.network_mode()? {
-        NetworkMode::Full if s.localhost.unwrap_or(false) => {
-            Network::Full(Loopback::All)
-        }
-        NetworkMode::Full => {
-            Network::Full(Loopback::Ports(s.local_ports.clone()))
-        }
+        NetworkMode::Full => Network::Full,
         NetworkMode::None => Network::None,
         NetworkMode::Filtered => match req.proxy_port {
             Some(port) => Network::Proxy(port),
             None => Network::None,
         },
+    };
+
+    let loopback = if s.localhost.unwrap_or(false) {
+        Loopback::All
+    } else {
+        Loopback::Ports(s.local_ports.clone())
     };
 
     // --- reads -----------------------------------------------------------
@@ -529,6 +532,10 @@ pub fn resolve(
         }
     }
 
+    for path in &agent_paths.hidden {
+        secrets.push(Rule::literal(canon(path)));
+    }
+
     let mut hidden_project = Vec::new();
     let mut reallow = Vec::new();
     let project_re = regex_escape(&req.project.to_string_lossy());
@@ -700,6 +707,7 @@ pub fn resolve(
         mach_services: mach,
         shm,
         network,
+        loopback,
         unix_sockets,
         unix_binds,
         tty: req.tty.map(Path::to_path_buf),
@@ -1286,6 +1294,48 @@ mod tests {
             ..Settings::default()
         };
         assert!(!fx.render(&open, None).contains("localhost"));
+
+        let filtered = Settings {
+            allow_hosts: vec!["github.com".into()],
+            local_ports: vec![3000],
+            ..Settings::default()
+        };
+        let text = fx.render(&filtered, None);
+        assert!(text.contains(
+            "(allow network-bind network-inbound (local ip \"localhost:3000\"))"
+        ));
+    }
+
+    #[test]
+    fn opencode_shares_its_state_but_not_the_host_server_password() {
+        let fx = Fixture::new("opencode");
+        let home = fx.home();
+        for dir in
+            [".local/share/opencode", ".config/opencode", ".opencode/bin"]
+        {
+            std::fs::create_dir_all(fx.host.home.join(dir)).unwrap();
+        }
+        let text = fx.render(&Settings::default(), Some(Agent::Opencode));
+        for dir in [".local/share/opencode", ".config/opencode", ".opencode"] {
+            assert!(
+                text.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{home}/{dir}\"))"
+                )),
+                "{dir}"
+            );
+        }
+        let allow =
+            text.find(&format!("(subpath \"{home}/.config/opencode\")"));
+        let deny = text.find(&format!(
+            "(deny file-read* file-write* \
+             (literal \"{home}/.config/opencode/service.json\"))"
+        ));
+        assert!(allow.is_some() && allow < deny, "{text}");
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath \"{home}/.opencode/bin\"))"
+        )));
+        assert!(!text.contains("SecurityServer"));
+        assert!(!text.contains(&format!("{home}/.claude\"")));
     }
 
     #[test]

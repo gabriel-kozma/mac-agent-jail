@@ -171,6 +171,11 @@ pub fn build(input: &Input) -> Result<Vec<(String, String)>, String> {
         for key in &PROXY_VARS[..4] {
             env.insert(key.to_string(), url.clone());
         }
+        // Loopback never goes through the proxy, which refuses non-public
+        // addresses. Seatbelt still decides which loopback ports are open.
+        for key in ["no_proxy", "NO_PROXY"] {
+            env.insert(key.to_string(), "localhost,127.0.0.1,::1".into());
+        }
         // Node's built-in fetch ignores *_proxy unless asked to honor it.
         env.insert("NODE_USE_ENV_PROXY".into(), "1".into());
     }
@@ -324,6 +329,7 @@ mod tests {
         for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
             assert_eq!(env[key], "http://127.0.0.1:4444");
         }
+        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1,::1");
         assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
         assert_eq!(env["PATH"], "/s/bin:/usr/bin:/bin");
     }

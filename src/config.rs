@@ -127,7 +127,7 @@ impl ConfigFile {
             if crate::agents::Agent::from_name(name).is_none() {
                 return Err(format!(
                     "unknown agent table [agents.{name}] \
-                     (expected claude, codex, or cursor)"
+                     (expected claude, codex, cursor, or opencode)"
                 ));
             }
         }
@@ -203,7 +203,8 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 # Keychain also holds every other credential saved on this Mac.
 # keychain = false
 
-# Share the agent's own state dir (~/.claude, ~/.codex, ~/.cursor).
+# Share the agent's own state dir (~/.claude, ~/.codex, ~/.cursor,
+# opencode's XDG directories).
 # agent_state = true
 
 # Optional host capabilities, all off by default.
@@ -238,6 +239,10 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 #
 # [agents.cursor]
 # rw = ["~/.cursor-server"]
+#
+# [agents.opencode]
+# allow_hosts = ["openrouter.ai"]   # your model provider, in filtered mode
+# local_ports = [11434]             # a local model server such as Ollama
 "#;
 
 #[cfg(test)]

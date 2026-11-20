@@ -22,6 +22,30 @@ use config::NetworkMode;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DEFAULT_SHELL: &str = "/bin/zsh";
 
+/// Runs `$1 serve` on loopback port `$2`, waits for it to listen, then runs
+/// the opencode client against it with the remaining arguments. The server
+/// ends with the client. See [`Agent::wants_private_server`].
+const OPENCODE_SERVER_SCRIPT: &str = r#"
+program=$1 port=$2
+shift 2
+log=/dev/null
+[ -n "$TMPDIR" ] && log="${TMPDIR}opencode-server.log"
+"$program" serve --hostname 127.0.0.1 --port "$port" >"$log" 2>&1 &
+server=$!
+trap 'kill "$server" 2>/dev/null' EXIT
+tries=0
+until /usr/bin/nc -z 127.0.0.1 "$port" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 150 ] || ! kill -0 "$server" 2>/dev/null; then
+        echo "mac-agent-jail: error: the opencode server did not start" >&2
+        cat "$log" >&2
+        exit 125
+    fi
+    sleep 0.1
+done
+"$program" --server "http://127.0.0.1:$port" "$@"
+"#;
+
 fn main() {
     if ps_shim::is_invoked_as_ps() {
         std::process::exit(ps_shim::run());
@@ -119,6 +143,31 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     }
     args.extend(settings.args.iter().cloned());
     args.extend(user_args);
+    // What sandbox-exec runs: the program itself, or a launcher around it.
+    let mut exec = program.clone();
+    if let Some(agent) = agent {
+        if let Some(message) = agent.server_warning(&args) {
+            warn(&message);
+        }
+        if agent.wants_private_server(&args) {
+            let port = free_loopback_port()?;
+            let password = random_token()?;
+            settings.local_ports.push(port);
+            for key in ["OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"] {
+                settings.env.push(format!("{key}={password}"));
+            }
+            let mut launcher = vec![
+                "-c".to_string(),
+                OPENCODE_SERVER_SCRIPT.to_string(),
+                "mac-agent-jail".to_string(),
+                program.to_string_lossy().into_owned(),
+                port.to_string(),
+            ];
+            launcher.append(&mut args);
+            args = launcher;
+            exec = PathBuf::from("/bin/sh");
+        }
+    }
     let shell_mode = cli.command.is_empty();
     if shell_mode {
         args.push("-i".into());
@@ -240,7 +289,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         print_dry_run(&DryRun {
             agent,
             project: &project,
-            program: &program,
+            program: &exec,
             args: &args,
             network,
             allow: &allow,
@@ -258,7 +307,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     cmd.arg("-p")
         .arg(&profile_text)
         .arg("--")
-        .arg(&program)
+        .arg(&exec)
         .args(&args)
         .current_dir(&project)
         .env_clear()
@@ -268,7 +317,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         Some(pty) => pty.run(cmd),
         None => process::run_plain(cmd),
     }
-    .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
+    .map_err(|e| format!("cannot run {}: {e}", exec.display()))?;
 
     if let Some(proxy) = &proxy {
         let blocked = proxy.blocked.lock().unwrap();
@@ -309,6 +358,25 @@ fn find_program(name: &str, path: &[PathBuf]) -> Option<PathBuf> {
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|p| is_exec(p))
+}
+
+/// A loopback port nothing listens on right now.
+fn free_loopback_port() -> Result<u16, String> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .map_err(|e| format!("cannot find a free loopback port: {e}"))
+}
+
+/// 128 random bits as hex.
+fn random_token() -> Result<String, String> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// This run's private TMPDIR, removed when the run ends.
@@ -490,6 +558,15 @@ mod tests {
             find_program("definitely-not-a-command", &[PathBuf::from("/bin")]),
             None
         );
+    }
+
+    #[test]
+    fn tokens_and_ports() {
+        let token = random_token().unwrap();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(token, random_token().unwrap());
+        assert!(free_loopback_port().unwrap() > 0);
     }
 
     #[test]

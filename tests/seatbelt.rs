@@ -363,6 +363,32 @@ fn loopback_is_closed_until_a_port_is_listed() {
 }
 
 #[test]
+fn a_listed_loopback_port_can_be_served_inside_a_filtered_jail() {
+    let project = Project::new("serve");
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port().to_string()
+    };
+    // A server and its client, both inside the jail.
+    let script = format!(
+        "/usr/bin/nc -l 127.0.0.1 {port} >/dev/null & \
+         for try in 1 2 3 4 5 6 7 8 9 10; do \
+             /usr/bin/nc -z -G 2 127.0.0.1 {port} 2>/dev/null && exit 0; \
+             sleep 0.2; \
+         done; exit 1"
+    );
+    let command = ["/bin/zsh", "-c", script.as_str()];
+    let open = jail(
+        &project.path,
+        &["--net", "filtered", "--local-port", &port],
+        &command,
+    );
+    assert!(open.status.success(), "listed port\n{}", show(&open));
+    let closed = jail(&project.path, &["--net", "filtered"], &command);
+    assert!(!closed.status.success(), "unlisted port\n{}", show(&closed));
+}
+
+#[test]
 fn a_project_without_a_repository_cannot_grow_a_git_dir() {
     let project = Project::new("nogit");
     let script = r#"

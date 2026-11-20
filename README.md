@@ -1,12 +1,13 @@
 # mac-agent-jail
 
-Run AI coding agents — **Claude Code**, **Codex**, and the **Cursor CLI** — in a
+Run AI coding agents — **Claude Code**, **Codex**, the **Cursor CLI**, and
+**opencode** — in a
 macOS Seatbelt (`sandbox-exec`) sandbox that confines them to the current
 project directory. The **macOS Keychain is opened only for the agents that
 keep their login there** (Claude Code, Cursor), so they start authenticated.
 
 Based on [akitaonrails/ai-jail](https://github.com/akitaonrails/ai-jail), but
-macOS-only and tuned for these three agents. Like ai-jail, it is an
+macOS-only and tuned for these four agents. Like ai-jail, it is an
 accident-prevention layer for "YOLO mode" agents, not a boundary against
 hostile code (use a VM for that).
 
@@ -25,6 +26,7 @@ cd ~/Projects/my-app
 mac-agent-jail claude --dangerously-skip-permissions
 mac-agent-jail codex
 mac-agent-jail cursor            # runs cursor-agent
+mac-agent-jail opencode
 mac-agent-jail                   # sandboxed zsh
 mac-agent-jail --dry-run claude  # print the Seatbelt profile
 ```
@@ -35,7 +37,9 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   as the project.
 - **Rest of `$HOME`**: hidden, except:
   - the agent's own state, read-write (`~/.claude` + `~/.claude.json`,
-    `~/.codex`, `~/.cursor` + `~/.config/cursor`)
+    `~/.codex`, `~/.cursor` + `~/.config/cursor`, opencode's
+    `~/.local/share/opencode`, `~/.config/opencode`,
+    `~/.local/state/opencode` and `~/.opencode`)
   - toolchains read-only (nvm, mise, rustup, pyenv, `~/.local/bin`, PATH
     entries under home, `.gitconfig`, ...)
   - package caches read-write (`~/.npm`, `~/.cache`, and the developer
@@ -45,8 +49,9 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   `/Library` (`Developer`, `Frameworks`, `Java`, ...) are read-only. Other
   applications' data in `/Library`, `/Applications`, other users, other
   volumes and `/tmp` are hidden.
-- **Keychain**: allowed for `claude` and `cursor`, blocked for `codex` (its
-  login is a file in `~/.codex`) and for any other command. Seatbelt cannot
+- **Keychain**: allowed for `claude` and `cursor`, blocked for `codex` and
+  `opencode` (their login is a file in their own directory) and for any
+  other command. Seatbelt cannot
   scope the Keychain to one item, so an agent with access can ask for any
   credential saved on this Mac. `--keychain` / `--no-keychain` override the
   default.
@@ -77,7 +82,8 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   such as tmux, docker and ssh-agent stay closed, because they reach host
   processes outside the jail. `--local-port 3000` opens one loopback port
   (for example a dev server the agent starts and then tests) and
-  `--localhost` opens all of it. Servers inside the jail can still listen.
+  `--localhost` opens all of it. Servers inside the jail can still listen
+  in full mode; in the other modes they can on a listed port.
   Use `--allow-host` / `--net filtered` for an allow-list through a local
   CONNECT proxy, or `--net none`.
 - **Terminal**: the agent runs on its own PTY, so `TIOCSTI` cannot inject
@@ -86,6 +92,14 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   Cloud credentials are never shared implicitly: with
   `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX` the jail warns and
   you share them yourself, for example `--env AWS_PROFILE --ro ~/.aws`.
+- **opencode**: its client normally talks to a background server shared by
+  all your sessions, which would run the agent's tools outside the jail.
+  The jail starts a private `opencode serve` on a loopback port it picks,
+  with a one-time password, and points the client at it; the server ends
+  with the session. The password of your host server
+  (`~/.config/opencode/service.json`) is hidden. In filtered mode only
+  `opencode.ai` and `models.dev` are allowed by default: add your model
+  provider with `--allow-host`.
 - **Nested sandboxes**: Codex gets `-c sandbox_mode="danger-full-access"`,
   because macOS refuses a nested `sandbox-exec` and the jail is already the
   sandbox.
@@ -95,7 +109,7 @@ Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`,
 `--ro/--rw/--deny`. See `mac-agent-jail --help`.
 
 Config: `~/.config/mac-agent-jail/config.toml` (`--print-config` prints an
-example), with `[agents.claude|codex|cursor]` tables. There is no
+example), with `[agents.claude|codex|cursor|opencode]` tables. There is no
 per-project config, so a repository cannot widen its own sandbox.
 
 ## Development

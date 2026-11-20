@@ -44,7 +44,7 @@ impl Rule {
     }
 }
 
-/// Loopback destinations reachable in full network mode. Services
+/// Loopback destinations reachable in every network mode. Services
 /// listening there (dev servers, debug ports, Docker's TCP API) are host
 /// processes outside the jail, like the Unix sockets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,8 +56,8 @@ pub enum Loopback {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Network {
-    /// Any IP destination, with loopback limited as given.
-    Full(Loopback),
+    /// Any IP destination that is not loopback.
+    Full,
     /// Only the filtered-egress proxy on this loopback port.
     Proxy(u16),
     None,
@@ -75,6 +75,7 @@ pub struct Profile {
     /// POSIX shared-memory names readable (and writable when `true`).
     pub shm: Vec<(String, bool)>,
     pub network: Network,
+    pub loopback: Loopback,
     /// Unix-domain sockets the sandbox may connect to.
     pub unix_sockets: Vec<Rule>,
     /// Unix-domain sockets the sandbox may bind (create and listen on).
@@ -205,21 +206,15 @@ pub fn render(profile: &Profile) -> String {
 }
 
 fn render_network(out: &mut String, profile: &Profile) {
-    match &profile.network {
-        Network::Full(loopback) => {
+    match profile.network {
+        Network::Full => {
             out.push_str("; Network: any IP destination\n");
             out.push_str("(allow system-socket)\n");
             out.push_str("(allow network-outbound (remote ip \"*:*\"))\n");
-            if let Loopback::Ports(ports) = loopback {
+            if profile.loopback != Loopback::All {
                 out.push_str(
                     "(deny network-outbound (remote ip \"localhost:*\"))\n",
                 );
-                for port in ports {
-                    out.push_str(&format!(
-                        "(allow network-outbound \
-                         (remote ip \"localhost:{port}\"))\n"
-                    ));
-                }
             }
             out.push_str("(allow network-inbound (local ip \"*:*\"))\n");
             out.push_str("(allow network-bind (local ip \"*:*\"))\n");
@@ -242,6 +237,7 @@ fn render_network(out: &mut String, profile: &Profile) {
             out.push_str("; Network: none\n\n");
         }
     }
+    render_loopback(out, profile);
 
     if profile.unix_sockets.is_empty() && profile.unix_binds.is_empty() {
         return;
@@ -261,6 +257,36 @@ fn render_network(out: &mut String, profile: &Profile) {
             "(allow network-bind network-inbound (local unix-socket {}))\n",
             socket_filter(rule)
         ));
+    }
+    out.push('\n');
+}
+
+/// Loopback ports opened on top of the network mode. Full mode already
+/// lets the jail listen anywhere; the other modes need that granted too, so
+/// a server inside the jail can serve a client inside it.
+fn render_loopback(out: &mut String, profile: &Profile) {
+    let ports: Vec<String> = match &profile.loopback {
+        Loopback::All if profile.network == Network::Full => return,
+        Loopback::All => vec!["*".into()],
+        Loopback::Ports(ports) => ports.iter().map(u16::to_string).collect(),
+    };
+    if ports.is_empty() {
+        return;
+    }
+    out.push_str("; Loopback\n");
+    if profile.network == Network::None {
+        out.push_str("(allow system-socket)\n");
+    }
+    for port in &ports {
+        out.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+        if profile.network != Network::Full {
+            out.push_str(&format!(
+                "(allow network-bind network-inbound \
+                 (local ip \"localhost:{port}\"))\n"
+            ));
+        }
     }
     out.push('\n');
 }
@@ -354,6 +380,7 @@ mod tests {
             mach_services: Vec::new(),
             shm: Vec::new(),
             network: Network::None,
+            loopback: Loopback::Ports(Vec::new()),
             unix_sockets: Vec::new(),
             unix_binds: Vec::new(),
             tty: None,
@@ -400,7 +427,8 @@ mod tests {
     #[test]
     fn full_network_excludes_arbitrary_unix_sockets() {
         let mut profile = empty();
-        profile.network = Network::Full(Loopback::All);
+        profile.network = Network::Full;
+        profile.loopback = Loopback::All;
         let text = render(&profile);
         assert!(text.contains("(remote ip \"*:*\")"));
         assert!(text.contains("/private/var/run/mDNSResponder"));
@@ -411,7 +439,8 @@ mod tests {
     #[test]
     fn full_network_closes_loopback_except_listed_ports() {
         let mut profile = empty();
-        profile.network = Network::Full(Loopback::Ports(vec![3000]));
+        profile.network = Network::Full;
+        profile.loopback = Loopback::Ports(vec![3000]);
         let text = render(&profile);
         let any = text.find("(allow network-outbound (remote ip \"*:*\"))");
         let deny =
@@ -428,6 +457,29 @@ mod tests {
         let text = render(&profile);
         assert!(text.contains("(remote ip \"localhost:40123\")"));
         assert!(!text.contains("*:*"));
+    }
+
+    #[test]
+    fn loopback_ports_can_be_served_in_filtered_and_no_network_modes() {
+        let mut profile = empty();
+        profile.network = Network::Proxy(40123);
+        profile.loopback = Loopback::Ports(vec![4096]);
+        let text = render(&profile);
+        assert!(text.contains(
+            "(allow network-outbound (remote ip \"localhost:4096\"))"
+        ));
+        assert!(text.contains(
+            "(allow network-bind network-inbound (local ip \"localhost:4096\"))"
+        ));
+        assert!(!text.contains("*:*"));
+
+        profile.network = Network::None;
+        let text = render(&profile);
+        assert!(text.contains("(allow system-socket)\n"));
+        assert!(text.contains("(local ip \"localhost:4096\")"));
+
+        profile.loopback = Loopback::Ports(Vec::new());
+        assert!(!render(&profile).contains("localhost"));
     }
 
     #[test]

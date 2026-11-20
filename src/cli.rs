@@ -11,6 +11,7 @@ USAGE:
     mac-agent-jail claude --dangerously-skip-permissions
     mac-agent-jail codex
     mac-agent-jail cursor          (runs the Cursor CLI, cursor-agent)
+    mac-agent-jail opencode
     mac-agent-jail                 (a sandboxed zsh)
 
 The current directory is the project: readable and writable. The rest of
@@ -22,9 +23,9 @@ NETWORK:
     --no-network            same as --net none
     --allow-host HOST       allow HOST and its subdomains (implies filtered);
                             the agent's own API hosts are always included
-    --local-port PORT       in full mode, allow connecting to a loopback
-                            port (repeatable); loopback is closed otherwise
-    --localhost             in full mode, allow all of loopback
+    --local-port PORT       allow a loopback port (repeatable); loopback is
+                            closed otherwise
+    --localhost             allow all of loopback
 
 FILESYSTEM:
     --ro PATH               extra read-only path (repeatable)
@@ -40,7 +41,8 @@ HOST CAPABILITIES:
     --keychain              allow macOS Keychain access
     --no-keychain           block it (default: allowed for claude and
                             cursor, which keep their login there)
-    --no-agent-state        do not share ~/.claude, ~/.codex, ~/.cursor
+    --no-agent-state        do not share ~/.claude, ~/.codex, ~/.cursor,
+                            or opencode's directories
     --ssh-agent             forward $SSH_AUTH_SOCK
     --unix-socket PATH      allow connecting to a Unix socket (repeatable)
     --mach-service NAME     allow an extra Mach service lookup (repeatable)
