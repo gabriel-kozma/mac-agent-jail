@@ -6,7 +6,8 @@ use crate::{
     agents::{Agent, expand_home},
     config::{NetworkMode, Settings},
     profile::{
-        Match, Network, Profile, Rule, Section, ancestors, regex_escape,
+        Loopback, Match, Network, Profile, Rule, Section, ancestors,
+        regex_escape,
     },
 };
 
@@ -19,13 +20,27 @@ use crate::{
 /// `developer_dir` there, and Seatbelt treats `readlink` as
 /// `file-read-data`. Metadata on the parent denies them with
 /// "unable to read data link".
+///
+/// Only the toolchain parts of `/Library` are listed. The rest holds other
+/// applications' data, preferences and logs. The Xcode preferences record
+/// the accepted license; without them every `/usr/bin` shim refuses to run.
 const SYSTEM_READ: &[&str] = &[
     "/System",
     "/usr",
     "/bin",
     "/sbin",
     "/private/etc",
-    "/Library",
+    "/Library/Apple",
+    "/Library/Developer",
+    "/Library/Fonts",
+    "/Library/Frameworks",
+    "/Library/Java",
+    "/Library/Perl",
+    "/Library/Preferences/com.apple.dt.Xcode.plist",
+    "/Library/Python",
+    "/Library/Ruby",
+    "/Library/Tcl",
+    "/Library/TeX",
     "/opt",
     "/dev",
     "/nix",
@@ -78,11 +93,34 @@ const HOME_TOOLCHAINS: &[&str] = &[
     ".editorconfig",
 ];
 
-/// Package-manager caches under `$HOME`, read-write.
+/// Package-manager caches under `$HOME`, read-write. `~/Library/Caches` is
+/// shared with every application on the Mac (browsers, mail, system
+/// agents), so only the developer tools' own directories are listed.
 const HOME_CACHES: &[&str] = &[
     ".cache",
     ".npm",
-    "Library/Caches",
+    "Library/Caches/claude-cli-nodejs",
+    "Library/Caches/CocoaPods",
+    "Library/Caches/Coursier",
+    "Library/Caches/Cypress",
+    "Library/Caches/deno",
+    "Library/Caches/electron",
+    "Library/Caches/electron-builder",
+    "Library/Caches/go-build",
+    "Library/Caches/golangci-lint",
+    "Library/Caches/Homebrew",
+    "Library/Caches/Mozilla.sccache",
+    "Library/Caches/ms-playwright",
+    "Library/Caches/node-gyp",
+    "Library/Caches/org.swift.swiftpm",
+    "Library/Caches/pip",
+    "Library/Caches/pnpm",
+    "Library/Caches/pypoetry",
+    "Library/Caches/ruff",
+    "Library/Caches/turbo",
+    "Library/Caches/typescript",
+    "Library/Caches/uv",
+    "Library/Caches/Yarn",
     ".cargo/registry",
     ".cargo/git",
     "go/pkg/mod",
@@ -94,6 +132,14 @@ const HOME_CACHES: &[&str] = &[
     ".m2/repository",
     ".node-gyp",
     ".local/state/mise",
+];
+
+/// Files under the read-write caches that the host runs outside the jail
+/// (Gradle applies init scripts to every build), write-protected.
+const HOME_WRITE_PROTECTED: &[&str] = &[
+    ".gradle/init.d",
+    ".gradle/init.gradle",
+    ".gradle/init.gradle.kts",
 ];
 
 /// Credential stores that stay hidden even when a broader grant (for
@@ -110,6 +156,9 @@ const HOME_SECRETS: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".git-credentials",
+    ".config/git/credentials",
+    ".gradle/gradle.properties",
+    ".cache/huggingface/token",
     ".password-store",
     ".config/gh",
     ".config/gcloud",
@@ -135,6 +184,8 @@ const BASE_MACH_SERVICES: &[&str] = &[
     "com.apple.SystemConfiguration.DNSConfiguration",
     "com.apple.trustd",
     "com.apple.trustd.agent",
+    // /usr/bin/curl verifies chains /etc/ssl/cert.pem cannot through it.
+    "com.apple.TrustEvaluationAgent",
     "com.apple.ocspd",
     "com.apple.FSEvents",
 ];
@@ -163,6 +214,27 @@ const OPEN_URL_MACH_SERVICES: &[&str] = &[
 
 const CLIPBOARD_MACH_SERVICES: &[&str] = &["com.apple.pasteboard.1"];
 
+/// Directories (as regex fragments, at any depth in the project) where
+/// package managers check out git dependencies: SwiftPM, Carthage,
+/// Composer/Bundler/Go, npm, Mix, rebar3, CMake FetchContent, Meson,
+/// Terraform, pip editable installs and PlatformIO. Repositories may be
+/// created there. Their content is build input the agent can already
+/// rewrite, like `node_modules`, so their hooks are not protected either.
+const GIT_DEPENDENCY_DIRS: &[&str] = &[
+    "\\.build/checkouts",
+    "Carthage/Checkouts",
+    "vendor",
+    "node_modules",
+    "deps",
+    "_build",
+    "_deps",
+    "subprojects",
+    "\\.terraform/modules",
+    "\\.venv/src",
+    "venv/src",
+    "\\.pio/libdeps",
+];
+
 const DEFAULT_HIDE: &[&str] = &[".env", ".env.*"];
 const DEFAULT_HIDE_EXCEPTIONS: &[&str] =
     &["example", "sample", "template", "dist"];
@@ -180,6 +252,8 @@ pub struct Host {
     pub session_dir: Option<PathBuf>,
     /// The canonical path of this executable (Codex `ps` shim target).
     pub exe: Option<PathBuf>,
+    /// The config file this run loaded, wherever it lives.
+    pub config: Option<PathBuf>,
     /// Host PATH entries.
     pub path: Vec<PathBuf>,
     pub ssh_auth_sock: Option<PathBuf>,
@@ -198,6 +272,14 @@ pub struct Request<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
 }
 
+/// Keychain access: an explicit setting, or on for the agents that keep
+/// their login there.
+pub fn keychain_enabled(settings: &Settings, agent: Option<Agent>) -> bool {
+    settings
+        .keychain
+        .unwrap_or(agent.is_some_and(Agent::uses_keychain))
+}
+
 /// Non-fatal problems found while resolving, reported to the user.
 pub type Warnings = Vec<String>;
 
@@ -208,7 +290,7 @@ pub fn resolve(
     let mut warnings = Warnings::new();
     let s = req.settings;
     let home = &host.home;
-    let keychain = s.keychain.unwrap_or(true);
+    let keychain = keychain_enabled(s, req.agent);
     let agent_state = s.agent_state.unwrap_or(true);
 
     let network = match s.network_mode()? {
@@ -218,6 +300,12 @@ pub fn resolve(
             Some(port) => Network::Proxy(port),
             None => Network::None,
         },
+    };
+
+    let loopback = if s.localhost.unwrap_or(false) {
+        Loopback::All
+    } else {
+        Loopback::Ports(s.local_ports.clone())
     };
 
     // --- reads -----------------------------------------------------------
@@ -245,6 +333,7 @@ pub fn resolve(
     for entry in &host.path {
         if entry.is_absolute()
             && entry.starts_with(home)
+            && canon(entry) != *home
             && entry.is_dir()
             && !is_secret(home, entry)
         {
@@ -320,8 +409,9 @@ pub fn resolve(
 
     // --- writes ----------------------------------------------------------
     let mut project_rules = vec![Rule::subpath(req.project)];
-    if let Some(gitdir) = linked_worktree_gitdir(req.project) {
-        project_rules.push(Rule::subpath(gitdir));
+    let worktree = linked_worktree(req.project);
+    if let Some(worktree) = &worktree {
+        project_rules.push(Rule::subpath(&worktree.common));
     }
 
     let mut state = Vec::new();
@@ -344,10 +434,19 @@ pub fn resolve(
     let mut caches = Vec::new();
     for rel in HOME_CACHES {
         let path = home.join(rel);
-        if exists(&path) || matches!(*rel, ".cache" | ".npm" | "Library/Caches")
+        // Tools create their cache on first use, and the parent
+        // directories are not writable.
+        if exists(&path)
+            || matches!(*rel, ".cache" | ".npm")
+            || rel.starts_with("Library/Caches/")
         {
             caches.push(Rule::subpath(canon(&path)));
         }
+    }
+
+    if let Some(cache) = &host.user_cache_dir {
+        // clang and swiftc keep their module cache here, whatever TMPDIR is.
+        caches.push(Rule::subpath(cache.join("clang")));
     }
 
     let mut temp = Vec::new();
@@ -399,6 +498,8 @@ pub fn resolve(
             keychain_rw.push(Rule::subpath(cache.join("mds")));
         }
         keychain_ro.push(Rule::subpath("/private/var/db/mds"));
+        // The System keychain is on the default search list.
+        keychain_ro.push(Rule::subpath("/Library/Keychains"));
         let prefs = home.join("Library/Preferences/com.apple.security.plist");
         keychain_ro.push(Rule::literal(canon(&prefs)));
     }
@@ -429,6 +530,10 @@ pub fn resolve(
         if exists(&path) && !granted {
             secrets.push(rule_for(&path));
         }
+    }
+
+    for path in &agent_paths.hidden {
+        secrets.push(Rule::literal(canon(path)));
     }
 
     let mut hidden_project = Vec::new();
@@ -462,6 +567,7 @@ pub fn resolve(
     }
 
     let mut protected = Vec::new();
+    let mut dependencies = Vec::new();
     for path in &agent_paths.write_protected {
         protected.push(Rule::subpath(canon(path)));
     }
@@ -470,13 +576,49 @@ pub fn resolve(
     }
     if !s.git_hooks.unwrap_or(false) {
         // Hooks and config (core.hooksPath, core.fsmonitor) run on the host
-        // the next time git is used outside the jail.
-        protected.push(Rule::subpath(req.project.join(".git/hooks")));
-        protected.push(Rule::Regex(format!(
-            "^{project_re}/\\.git/config(\\.lock)?$"
+        // the next time git is used outside the jail. That holds for every
+        // repository in the project, not only the top one, and for the git
+        // dirs outside it that the project points to: a symlinked `.git`
+        // and a linked worktree's shared dir. Submodules and worktrees keep
+        // their own hooks and config below those.
+        let mut git_dirs = vec![format!("{project_re}/(.*/)?\\.git")];
+        let real = canon(&req.project.join(".git"));
+        if !real.starts_with(req.project) {
+            git_dirs.push(regex_escape(&real.to_string_lossy()));
+        }
+        if let Some(worktree) = &worktree {
+            git_dirs.push(regex_escape(&worktree.common.to_string_lossy()));
+            protected.push(Rule::literal(worktree.gitdir.join("commondir")));
+        }
+        for dir_re in &git_dirs {
+            protected.push(Rule::Regex(format!(
+                "^{dir_re}/\
+                 (hooks(/.*)?|config(\\.worktree)?(\\.lock)?|commondir)$"
+            )));
+            protected.push(Rule::Regex(format!(
+                "^{dir_re}/(modules|worktrees)/.+/\
+                 (hooks(/.*)?|config(\\.worktree)?(\\.lock)?)$"
+            )));
+        }
+        // A `.git` node says where hooks and config are read from, so none
+        // may be created, replaced, renamed or removed. `git init`,
+        // `git clone` and `git worktree add` inside the project belong on
+        // the host; a cloned repository's hooks would be the agent's.
+        protected.push(Rule::Regex(format!("^{project_re}/(.*/)?\\.git$")));
+        // Seatbelt sees paths, not which program runs git, so package
+        // managers are told apart by where they put their checkouts.
+        dependencies.push(Rule::Regex(format!(
+            "^{project_re}/(.*/)?({})/(.*/)?\\.git(/.*)?$",
+            GIT_DEPENDENCY_DIRS.join("|")
         )));
     }
+    for rel in HOME_WRITE_PROTECTED {
+        protected.push(Rule::subpath(canon(&home.join(rel))));
+    }
     protected.push(Rule::subpath(canon(&home.join(".config/mac-agent-jail"))));
+    if let Some(config) = &host.config {
+        protected.push(Rule::literal(config));
+    }
 
     // --- mach, shm -------------------------------------------------------
     let mut mach = vec![Section {
@@ -565,6 +707,7 @@ pub fn resolve(
         mach_services: mach,
         shm,
         network,
+        loopback,
         unix_sockets,
         unix_binds,
         tty: req.tty.map(Path::to_path_buf),
@@ -578,6 +721,10 @@ pub fn resolve(
         reallow,
         denied: vec![section("Denied paths (--deny)", denied)],
         deny_write: vec![section("Write-protected paths", protected)],
+        reallow_write: vec![section(
+            "Git checkouts made by package managers",
+            dependencies,
+        )],
     };
     Ok((profile, warnings))
 }
@@ -606,10 +753,16 @@ fn project_glob_regex(
     Ok(format!("^{project_re}/{prefix}{body}(/.*)?$"))
 }
 
-/// The per-worktree git dir of a linked worktree, when the project's `.git`
-/// is a `gitdir:` file. Commits also write the shared object store, so the
-/// common dir (two levels up from `.git/worktrees/<name>`) is included.
-fn linked_worktree_gitdir(project: &Path) -> Option<PathBuf> {
+/// The git dirs of a linked worktree.
+struct Worktree {
+    /// The per-worktree git dir (`.git/worktrees/<name>`).
+    gitdir: PathBuf,
+    /// The shared git dir, two levels up. Commits write its object store.
+    common: PathBuf,
+}
+
+/// The git dirs behind the project, when its `.git` is a `gitdir:` file.
+fn linked_worktree(project: &Path) -> Option<Worktree> {
     let dotgit = project.join(".git");
     if !dotgit.is_file() {
         return None;
@@ -618,9 +771,9 @@ fn linked_worktree_gitdir(project: &Path) -> Option<PathBuf> {
     let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir: "))?;
     let gitdir = project.join(gitdir.trim());
     let gitdir = std::fs::canonicalize(gitdir).ok()?;
-    let common = gitdir.parent()?.parent()?;
+    let common = gitdir.parent()?.parent()?.to_path_buf();
     (common.file_name()? == ".git" || common.join("objects").is_dir())
-        .then(|| common.to_path_buf())
+        .then_some(Worktree { gitdir, common })
 }
 
 fn xcode_bundle() -> Option<PathBuf> {
@@ -734,6 +887,8 @@ mod tests {
                 ".cursor/extensions",
                 ".ssh",
                 ".aws",
+                ".config/git",
+                ".gradle",
                 ".local/bin",
                 ".local/share/claude/versions",
                 ".nvm/versions/node/v22/bin",
@@ -745,6 +900,8 @@ mod tests {
             std::fs::write(home.join(".gitconfig"), "").unwrap();
             std::fs::write(home.join(".ssh/id_ed25519"), "key").unwrap();
             std::fs::write(home.join(".ssh/known_hosts"), "").unwrap();
+            std::fs::write(home.join(".config/git/credentials"), "").unwrap();
+            std::fs::write(home.join(".gradle/gradle.properties"), "").unwrap();
             let home = std::fs::canonicalize(home).unwrap();
             let project = std::fs::canonicalize(project).unwrap();
             let host = Host {
@@ -753,6 +910,7 @@ mod tests {
                 user_cache_dir: Some(PathBuf::from("/private/var/folders/x/C")),
                 session_dir: Some(PathBuf::from("/private/var/folders/x/T/s")),
                 exe: Some(PathBuf::from("/opt/maj/bin/mac-agent-jail")),
+                config: Some(PathBuf::from("/opt/maj/etc/jail.toml")),
                 path: vec![
                     home.join(".nvm/versions/node/v22/bin"),
                     home.join(".ssh"),
@@ -794,15 +952,24 @@ mod tests {
     }
 
     #[test]
-    fn keychain_is_allowed_by_default_for_every_agent() {
+    fn keychain_is_allowed_by_default_only_for_agents_that_log_in_there() {
         let fx = Fixture::new("keychain");
-        for agent in [
-            None,
-            Some(Agent::Claude),
-            Some(Agent::Codex),
-            Some(Agent::Cursor),
-        ] {
+        for agent in [None, Some(Agent::Codex)] {
             let text = fx.render(&Settings::default(), agent);
+            assert!(!text.contains("SecurityServer"), "{agent:?}");
+            assert!(!text.contains("Library/Keychains"), "{agent:?}");
+        }
+        let on = Settings {
+            keychain: Some(true),
+            ..Settings::default()
+        };
+        for (settings, agent) in [
+            (Settings::default(), Some(Agent::Claude)),
+            (Settings::default(), Some(Agent::Cursor)),
+            (on.clone(), Some(Agent::Codex)),
+            (on, None),
+        ] {
+            let text = fx.render(&settings, agent);
             for service in [
                 "com.apple.SecurityServer",
                 "com.apple.securityd.xpc",
@@ -916,6 +1083,41 @@ mod tests {
     }
 
     #[test]
+    fn credentials_inside_granted_directories_stay_hidden() {
+        let fx = Fixture::new("nested-secrets");
+        let home = fx.home();
+        let text = fx.render(&Settings::default(), None);
+        for (grant, secret) in [
+            (
+                format!("(allow file-read* (subpath \"{home}/.config/git\"))"),
+                format!("(literal \"{home}/.config/git/credentials\"))"),
+            ),
+            (
+                format!(
+                    "(allow file-read* file-write* (subpath \"{home}/.gradle\"))"
+                ),
+                format!("(literal \"{home}/.gradle/gradle.properties\"))"),
+            ),
+        ] {
+            let allow = text.find(&grant);
+            let deny =
+                text.find(&format!("(deny file-read* file-write* {secret}"));
+            assert!(allow.is_some() && allow < deny, "{secret}\n{text}");
+        }
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath \"{home}/.gradle/init.d\"))"
+        )));
+    }
+
+    #[test]
+    fn a_path_entry_equal_to_home_is_skipped() {
+        let mut fx = Fixture::new("path-home");
+        fx.host.path.push(fx.host.home.clone());
+        let text = fx.render(&Settings::default(), None);
+        assert!(!text.contains(&format!("(subpath \"{}\")", fx.home())));
+    }
+
+    #[test]
     fn broad_grants_do_not_expose_secrets_but_explicit_ones_do() {
         let fx = Fixture::new("grants");
         let home = fx.home();
@@ -1014,17 +1216,44 @@ mod tests {
     #[test]
     fn git_hooks_are_write_protected_by_default() {
         let fx = Fixture::new("git");
+        let project = regex_escape(&fx.project.to_string_lossy());
         let text = fx.render(&Settings::default(), None);
         assert!(text.contains(&format!(
-            "(deny file-write* (subpath \"{}/.git/hooks\"))",
-            fx.project.display()
+            "(deny file-write* (regex #\"^{project}/(.*/)?\\.git/\
+             (hooks(/.*)?|config(\\.worktree)?(\\.lock)?|commondir)$\"))"
         )));
-        assert!(text.contains("/\\.git/config(\\.lock)?$"));
+        assert!(text.contains(&format!(
+            "^{project}/(.*/)?\\.git/(modules|worktrees)/.+/(hooks(/.*)?|"
+        )));
         let allowed = Settings {
             git_hooks: Some(true),
             ..Settings::default()
         };
-        assert!(!fx.render(&allowed, None).contains(".git/hooks"));
+        assert!(!fx.render(&allowed, None).contains("hooks"));
+    }
+
+    #[test]
+    fn git_dirs_cannot_be_created_or_replaced_anywhere_in_the_project() {
+        let fx = Fixture::new("git-nodes");
+        let node = format!(
+            "(deny file-write* (regex #\"^{}/(.*/)?\\.git$\"))",
+            regex_escape(&fx.project.to_string_lossy())
+        );
+        let text = fx.render(&Settings::default(), None);
+        let deny = text.find(&node);
+        let dependencies = text.find(&format!(
+            "(allow file-write* (regex #\"^{}/(.*/)?(\\.build/checkouts|",
+            regex_escape(&fx.project.to_string_lossy())
+        ));
+        assert!(deny.is_some() && deny < dependencies, "{text}");
+        assert!(text.contains("|vendor|node_modules|"));
+        let allowed = Settings {
+            git_hooks: Some(true),
+            ..Settings::default()
+        };
+        let text = fx.render(&allowed, None);
+        assert!(!text.contains(&node));
+        assert!(!text.contains("allow file-write* (regex"));
     }
 
     #[test]
@@ -1045,6 +1274,92 @@ mod tests {
         };
         let text = fx.render(&none, None);
         assert!(!text.contains("(remote ip"));
+    }
+
+    #[test]
+    fn loopback_is_closed_in_full_mode_unless_opened() {
+        let fx = Fixture::new("loopback");
+        let deny = "(deny network-outbound (remote ip \"localhost:*\"))";
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(deny));
+        let ports = Settings {
+            local_ports: vec![3000],
+            ..Settings::default()
+        };
+        let text = fx.render(&ports, None);
+        assert!(text.contains(deny));
+        assert!(text.contains("(remote ip \"localhost:3000\")"));
+        let open = Settings {
+            localhost: Some(true),
+            ..Settings::default()
+        };
+        assert!(!fx.render(&open, None).contains("localhost"));
+
+        let filtered = Settings {
+            allow_hosts: vec!["github.com".into()],
+            local_ports: vec![3000],
+            ..Settings::default()
+        };
+        let text = fx.render(&filtered, None);
+        assert!(text.contains(
+            "(allow network-bind network-inbound (local ip \"localhost:3000\"))"
+        ));
+    }
+
+    #[test]
+    fn opencode_shares_its_state_but_not_the_host_server_password() {
+        let fx = Fixture::new("opencode");
+        let home = fx.home();
+        for dir in
+            [".local/share/opencode", ".config/opencode", ".opencode/bin"]
+        {
+            std::fs::create_dir_all(fx.host.home.join(dir)).unwrap();
+        }
+        let text = fx.render(&Settings::default(), Some(Agent::Opencode));
+        for dir in [".local/share/opencode", ".config/opencode", ".opencode"] {
+            assert!(
+                text.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{home}/{dir}\"))"
+                )),
+                "{dir}"
+            );
+        }
+        let allow =
+            text.find(&format!("(subpath \"{home}/.config/opencode\")"));
+        let deny = text.find(&format!(
+            "(deny file-read* file-write* \
+             (literal \"{home}/.config/opencode/service.json\"))"
+        ));
+        assert!(allow.is_some() && allow < deny, "{text}");
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath \"{home}/.opencode/bin\"))"
+        )));
+        assert!(!text.contains("SecurityServer"));
+        assert!(!text.contains(&format!("{home}/.claude\"")));
+    }
+
+    #[test]
+    fn caches_and_system_library_are_narrowed_to_developer_tools() {
+        let fx = Fixture::new("narrow");
+        let home = fx.home();
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&format!(
+            "(allow file-read* file-write* (subpath \"{home}/Library/Caches/pip\"))"
+        )));
+        assert!(
+            !text.contains(&format!("(subpath \"{home}/Library/Caches\")"))
+        );
+        assert!(!text.contains("(subpath \"/Library\")"));
+        assert!(!text.contains("/Library/Application Support"));
+    }
+
+    #[test]
+    fn the_loaded_config_file_is_write_protected() {
+        let fx = Fixture::new("config");
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(
+            "(deny file-write* (literal \"/opt/maj/etc/jail.toml\"))"
+        ));
     }
 
     #[test]
@@ -1116,8 +1431,40 @@ mod tests {
             format!("gitdir: {}\n", gitdir.display()),
         )
         .unwrap();
-        let common = linked_worktree_gitdir(&wt).unwrap();
-        assert_eq!(common, canon(&main.join(".git")));
-        assert!(linked_worktree_gitdir(&fx.project).is_none());
+        let worktree = linked_worktree(&wt).unwrap();
+        assert_eq!(worktree.common, canon(&main.join(".git")));
+        assert_eq!(worktree.gitdir, canon(&gitdir));
+        assert!(linked_worktree(&fx.project).is_none());
+    }
+
+    #[test]
+    fn linked_worktree_protects_the_shared_hooks_and_config() {
+        let mut fx = Fixture::new("worktree-hooks");
+        let main = fx.root.join("main");
+        let gitdir = main.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        let wt = fx.root.join("feature");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        fx.project = canon(&wt);
+        let common = canon(&main.join(".git"));
+        let text = fx.render(&Settings::default(), None);
+        let allow = text.find(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))",
+            common.display()
+        ));
+        let deny = text.find(&format!(
+            "(deny file-write* (regex #\"^{}/(hooks(/.*)?|",
+            regex_escape(&common.to_string_lossy())
+        ));
+        assert!(allow.is_some() && allow < deny, "{text}");
+        assert!(text.contains(&format!(
+            "(deny file-write* (literal \"{}\"))",
+            canon(&gitdir).join("commondir").display()
+        )));
     }
 }

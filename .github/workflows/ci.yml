@@ -17,3 +17,56 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
+
+  # A v* tag publishes that version to the gabriel-kozma/homebrew-tap tap.
+  # Needs the HOMEBREW_TAP_TOKEN secret: a fine-grained token with
+  # Contents read-write on the tap repository.
+  homebrew:
+    name: homebrew
+    needs: test
+    if: startsWith(github.ref_name, 'v')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: Render the formula
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz"
+          # Homebrew downloads anonymously, so this fails while the
+          # repository is private, before a broken formula is published.
+          sha=$(curl -fsSL "$url" | shasum -a 256 | cut -d' ' -f1)
+          sed -e "s|@URL@|$url|" -e "s|@SHA256@|$sha|" \
+            packaging/homebrew/mac-agent-jail.rb > "$RUNNER_TEMP/mac-agent-jail.rb"
+      - uses: actions/checkout@v4
+        with:
+          repository: gabriel-kozma/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Install and test from the tap
+        run: |
+          mkdir -p tap/Formula
+          cp "$RUNNER_TEMP/mac-agent-jail.rb" tap/Formula/mac-agent-jail.rb
+          tap_dir="$(brew --repository)/Library/Taps/gabriel-kozma/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -s "$PWD/tap" "$tap_dir"
+          brew install --build-from-source gabriel-kozma/tap/mac-agent-jail
+          brew test gabriel-kozma/tap/mac-agent-jail
+          brew audit --strict gabriel-kozma/tap/mac-agent-jail
+      - name: Push the formula
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/mac-agent-jail.rb
+          if git diff --cached --quiet; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          git commit -m "mac-agent-jail ${GITHUB_REF_NAME#v}"
+          git push
