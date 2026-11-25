@@ -2,6 +2,7 @@ mod agents;
 mod cli;
 mod config;
 mod env;
+mod footer;
 mod policy;
 mod process;
 mod profile;
@@ -88,7 +89,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             print!("{}", config::EXAMPLE);
             return Ok(0);
         }
-        Action::Run => {}
+        Action::Run | Action::TrustConfig => {}
     }
 
     let host_env: Vec<(String, String)> = std::env::vars_os()
@@ -109,6 +110,42 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     });
     let config_file = config::load(&config_path)?;
 
+    // --- where -----------------------------------------------------------
+    let project = match &cli.project {
+        Some(dir) => dir.clone(),
+        None => std::env::current_dir()
+            .map_err(|e| format!("cannot read the current directory: {e}"))?,
+    };
+    let project = std::fs::canonicalize(&project)
+        .map_err(|e| format!("project {}: {e}", project.display()))?;
+    if !project.is_dir() {
+        return Err(format!(
+            "project {} is not a directory",
+            project.display()
+        ));
+    }
+    if home.starts_with(&project) {
+        return Err(format!(
+            "refusing to use {} as the project: it would make your whole \
+             home writable. cd into a project directory first.",
+            project.display()
+        ));
+    }
+
+    let project_config = project.join(config::PROJECT_FILE);
+    let trust_dir =
+        config::trust_dir(&home, getenv("XDG_CONFIG_HOME").as_deref());
+    if cli.action == Action::TrustConfig {
+        config::trust(&project_config, &trust_dir)?;
+        println!("approved {}", project_config.display());
+        return Ok(0);
+    }
+    let (project_file, note) =
+        config::load_project(&project_config, &trust_dir, !cli.dry_run)?;
+    if let Some(note) = note {
+        eprintln!("mac-agent-jail: {note}");
+    }
+
     // --- what to run -----------------------------------------------------
     let host_path: Vec<PathBuf> = getenv("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -120,6 +157,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         None => (None, DEFAULT_SHELL.to_string(), Vec::new()),
     };
     let mut settings = config_file.settings_for(agent.map(Agent::name));
+    settings.merge(&project_file.settings_for(agent.map(Agent::name)));
     settings.merge(&cli.settings);
     let network = settings.network_mode()?;
 
@@ -173,28 +211,6 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         args.push("-i".into());
     }
 
-    // --- where -----------------------------------------------------------
-    let project = match &cli.project {
-        Some(dir) => dir.clone(),
-        None => std::env::current_dir()
-            .map_err(|e| format!("cannot read the current directory: {e}"))?,
-    };
-    let project = std::fs::canonicalize(&project)
-        .map_err(|e| format!("project {}: {e}", project.display()))?;
-    if !project.is_dir() {
-        return Err(format!(
-            "project {} is not a directory",
-            project.display()
-        ));
-    }
-    if home.starts_with(&project) {
-        return Err(format!(
-            "refusing to use {} as the project: it would make your whole \
-             home writable. cd into a project directory first.",
-            project.display()
-        ));
-    }
-
     if !cli.dry_run && !Path::new(SANDBOX_EXEC).is_file() {
         return Err(format!(
             "{SANDBOX_EXEC} not found; mac-agent-jail requires macOS"
@@ -233,9 +249,18 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         && !cli.dry_run
         && process::is_tty(libc::STDIN_FILENO)
         && process::is_tty(libc::STDOUT_FILENO);
+    let footer = settings.footer.unwrap_or(true).then(|| {
+        footer_label(
+            agent.map_or("shell", Agent::name),
+            &project,
+            &home,
+            network,
+            policy::keychain_enabled(&settings, agent),
+        )
+    });
     let pty = if use_pty {
         Some(
-            process::Pty::open()
+            process::Pty::open(footer)
                 .map_err(|e| format!("cannot allocate a PTY: {e}"))?,
         )
     } else {
@@ -249,9 +274,12 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         user_cache_dir: darwin_dir(DarwinDir::Cache),
         session_dir: session_dir.clone(),
         exe: std::env::current_exe().ok().map(|p| policy::canon(&p)),
-        config: std::path::absolute(&config_path)
+        configs: std::path::absolute(&config_path)
             .ok()
-            .map(|p| policy::canon(&p)),
+            .into_iter()
+            .chain([project_config.clone(), trust_dir.clone()])
+            .map(|p| policy::canon(&p))
+            .collect(),
         path: host_path.clone(),
         ssh_auth_sock: getenv("SSH_AUTH_SOCK").map(PathBuf::from),
     };
@@ -331,6 +359,25 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     }
     drop(session);
     Ok(process::exit_code(status))
+}
+
+/// The text of the footer on the last row of the terminal.
+fn footer_label(
+    what: &str,
+    project: &Path,
+    home: &Path,
+    network: NetworkMode,
+    keychain: bool,
+) -> String {
+    let project = match project.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => project.display().to_string(),
+    };
+    format!(
+        " mac-agent-jail | {what} | {project} | network {} | keychain {} ",
+        network.as_str(),
+        if keychain { "on" } else { "off" },
+    )
 }
 
 fn home_dir(value: Option<String>) -> Result<PathBuf, String> {
@@ -534,6 +581,31 @@ fn quote(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footer_names_the_project_and_what_is_open() {
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            footer_label(
+                "claude",
+                Path::new("/Users/me/src/app"),
+                home,
+                NetworkMode::Filtered,
+                true
+            ),
+            " mac-agent-jail | claude | ~/src/app | network filtered | keychain on "
+        );
+        assert_eq!(
+            footer_label(
+                "shell",
+                Path::new("/Volumes/work"),
+                home,
+                NetworkMode::None,
+                false
+            ),
+            " mac-agent-jail | shell | /Volumes/work | network none | keychain off "
+        );
+    }
 
     #[test]
     fn quoting() {

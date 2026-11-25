@@ -56,7 +56,7 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   credential saved on this Mac. `--keychain` / `--no-keychain` override the
   default.
 - **Always hidden**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
-  `~/.config/gh`, `.netrc`, `.npmrc`, `~/.config/git/credentials`,
+  `.netrc`, `.npmrc`, `~/.config/git/credentials`,
   `~/.gradle/gradle.properties`, Mail and Messages, and similar stores.
   In the project, `.env` and `.env.*` are hidden (`.env.example` and similar
   stay visible).
@@ -87,7 +87,11 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   Use `--allow-host` / `--net filtered` for an allow-list through a local
   CONNECT proxy, or `--net none`.
 - **Terminal**: the agent runs on its own PTY, so `TIOCSTI` cannot inject
-  keystrokes into your shell.
+  keystrokes into your shell. The last row of your terminal is kept for a
+  footer naming the jail, the project and what is open (network, Keychain),
+  so you can see at a glance that a session is confined. The agent gets a
+  terminal one row shorter. Turn it off with `--no-footer` or
+  `footer = false`.
 - **Environment**: a minimal allowlist plus the agent's own API key variables.
   Cloud credentials are never shared implicitly: with
   `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX` the jail warns and
@@ -104,13 +108,27 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   because macOS refuses a nested `sandbox-exec` and the jail is already the
   sandbox.
 
+The GitHub CLI config (`~/.config/gh`) is shared read-only by default, so
+the agent can run `gh` as you: open pull requests, read issues, and anything
+else your token allows. gh keeps the token itself in the Keychain, so it
+also needs `--keychain` for agents that do not have it by default. `--no-gh`
+or `gh = false` hides the config again.
+
 Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`,
 `--open-urls`, `--clipboard`, `--unix-socket`, `--git-hooks`,
 `--ro/--rw/--deny`. See `mac-agent-jail --help`.
 
-Config: `~/.config/mac-agent-jail/config.toml` (`--print-config` prints an
-example), with `[agents.claude|codex|cursor|opencode]` tables. There is no
-per-project config, so a repository cannot widen its own sandbox.
+Config: `~/.config/mac-agent-jail/config.toml`, then `.mac-agent-jail.toml`
+at the root of the project, then the command line. Both files take
+`[agents.claude|codex|cursor|opencode]` tables; `--print-config` prints an
+example.
+
+The first run in a project creates `.mac-agent-jail.toml` with every
+setting commented out. A repository can ship that file, so it cannot widen
+its own sandbox: once the file sets anything, the jail refuses to start
+until you approve it with `mac-agent-jail --trust-config`, and again after
+every change. Approvals are kept under `~/.config/mac-agent-jail/trusted`.
+The agent can read the file but not change it.
 
 ## Development
 

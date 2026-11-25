@@ -55,11 +55,13 @@ pub struct Settings {
     pub keychain: Option<bool>,
     pub agent_state: Option<bool>,
     pub ssh_agent: Option<bool>,
+    pub gh: Option<bool>,
     pub open_urls: Option<bool>,
     pub clipboard: Option<bool>,
     pub git_hooks: Option<bool>,
     pub default_hide: Option<bool>,
     pub inherit_env: Option<bool>,
+    pub footer: Option<bool>,
     pub ro: Vec<String>,
     pub rw: Vec<String>,
     pub deny: Vec<String>,
@@ -82,11 +84,13 @@ impl Settings {
         scalar(&mut self.keychain, &other.keychain);
         scalar(&mut self.agent_state, &other.agent_state);
         scalar(&mut self.ssh_agent, &other.ssh_agent);
+        scalar(&mut self.gh, &other.gh);
         scalar(&mut self.open_urls, &other.open_urls);
         scalar(&mut self.clipboard, &other.clipboard);
         scalar(&mut self.git_hooks, &other.git_hooks);
         scalar(&mut self.default_hide, &other.default_hide);
         scalar(&mut self.inherit_env, &other.inherit_env);
+        scalar(&mut self.footer, &other.footer);
         self.allow_hosts.extend(other.allow_hosts.iter().cloned());
         self.local_ports.extend(other.local_ports.iter().copied());
         self.ro.extend(other.ro.iter().cloned());
@@ -111,7 +115,7 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ConfigFile {
     #[serde(flatten)]
@@ -156,12 +160,112 @@ pub fn default_path(home: &Path, xdg_config_home: Option<&str>) -> PathBuf {
 /// unsafe, or invalid one is an error, because silently dropping policy
 /// would weaken the sandbox.
 pub fn load(path: &Path) -> Result<ConfigFile, String> {
+    match read(path)? {
+        Some(text) => parse_at(path, &text),
+        None => Ok(ConfigFile::default()),
+    }
+}
+
+/// The config file at the root of a project.
+pub const PROJECT_FILE: &str = ".mac-agent-jail.toml";
+
+/// Where approved copies of project config files are kept.
+pub fn trust_dir(home: &Path, xdg_config_home: Option<&str>) -> PathBuf {
+    default_path(home, xdg_config_home).with_file_name("trusted")
+}
+
+/// Load a project's config file, creating it from the example when `create`
+/// is set and there is none. Also returns a note for the user, if any.
+///
+/// A repository can ship this file, so one that sets anything counts only
+/// while it matches the copy the user approved with `--trust-config`.
+/// Anything else is an error rather than ignored: the file may also narrow
+/// the sandbox.
+pub fn load_project(
+    path: &Path,
+    trust_dir: &Path,
+    create: bool,
+) -> Result<(ConfigFile, Option<String>), String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+    let Some(text) = read(path)? else {
+        if !create {
+            return Ok((ConfigFile::default(), None));
+        }
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(path)
+            .and_then(|mut file| file.write_all(EXAMPLE.as_bytes()));
+        let note = match written {
+            Ok(()) => format!(
+                "created {} with the default settings; edit it, then run \
+                 mac-agent-jail --trust-config",
+                path.display()
+            ),
+            Err(e) => format!("cannot create {}: {e}", path.display()),
+        };
+        return Ok((ConfigFile::default(), Some(note)));
+    };
+    let file = parse_at(path, &text)?;
+    let approved = std::fs::read_to_string(trust_record(trust_dir, path));
+    if file == ConfigFile::default() || approved.is_ok_and(|copy| copy == text)
+    {
+        return Ok((file, None));
+    }
+    Err(format!(
+        "{} is not approved: it came with the project or changed since you \
+         approved it. Review it, then run mac-agent-jail --trust-config \
+         (or delete it)",
+        path.display()
+    ))
+}
+
+/// Approve the project config file as it is now.
+pub fn trust(path: &Path, trust_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let text = read(path)?
+        .ok_or_else(|| format!("{}: no such file", path.display()))?;
+    parse_at(path, &text)?;
+    let record = trust_record(trust_dir, path);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(trust_dir)
+        .and_then(|()| std::fs::write(&record, &text))
+        .map_err(|e| format!("{}: {e}", record.display()))
+}
+
+/// The approved copy of the project config at `path`, named by a hash of
+/// the path. A collision only means approving again.
+fn trust_record(trust_dir: &Path, path: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    // FNV-1a.
+    let hash = path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    trust_dir.join(format!("{hash:016x}.toml"))
+}
+
+fn parse_at(path: &Path, text: &str) -> Result<ConfigFile, String> {
+    ConfigFile::parse(text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The text of a config file, or `None` if there is no such file.
+fn read(path: &Path) -> Result<Option<String>, String> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfigFile::default());
+            return Ok(None);
         }
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
@@ -180,13 +284,20 @@ pub fn load(path: &Path) -> Result<ConfigFile, String> {
             path.display()
         ));
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    ConfigFile::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent-jail/config.toml)
-# Command-line flags override everything here.
+pub const EXAMPLE: &str = r#"# mac-agent-jail configuration.
+#
+# Read from ~/.config/mac-agent-jail/config.toml, then from
+# .mac-agent-jail.toml at the root of the project, then the command line.
+# Later ones override single values and add to lists.
+#
+# After editing the project file, approve it with
+# `mac-agent-jail --trust-config`: the jail refuses a project file that
+# sets anything you have not approved, since a repository can ship one.
 
 # Network: "full" (default), "filtered" (allow-list through a local proxy),
 # or "none". A non-empty allow_hosts implies "filtered" unless set.
@@ -209,10 +320,17 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 
 # Optional host capabilities, all off by default.
 # ssh_agent = false   # forward $SSH_AUTH_SOCK (git over SSH)
+
+# The GitHub CLI config (~/.config/gh) is readable, so `gh` works as you
+# wherever the Keychain, which holds its token, is open. Set false to hide.
+# gh = true
 # open_urls = false   # let `open https://...` reach the host browser
 # clipboard = false   # pasteboard read/write (image paste)
 # git_hooks = false   # allow writing .git/hooks and .git/config, and
 #                     # creating repositories (git clone, git init)
+
+# A line on the last row of the terminal saying the agent is jailed.
+# footer = true
 
 # Extra paths ("~" is expanded).
 # ro = ["~/work/shared-libs"]
@@ -322,6 +440,49 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
             .unwrap();
         assert!(load(&path).unwrap_err().contains("writable"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn example_sets_nothing() {
+        assert_eq!(ConfigFile::parse(EXAMPLE).unwrap(), ConfigFile::default());
+    }
+
+    #[test]
+    fn project_config_is_created_then_needs_approval_to_set_anything() {
+        let dir = std::env::temp_dir()
+            .join(format!("maj-project-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        let path = dir.join("project").join(PROJECT_FILE);
+        let trusted = dir.join("trusted");
+
+        // Nothing is created unless asked (a dry run).
+        let (file, note) = load_project(&path, &trusted, false).unwrap();
+        assert_eq!((file, note), (ConfigFile::default(), None));
+        assert!(!path.exists());
+
+        let (file, note) = load_project(&path, &trusted, true).unwrap();
+        assert_eq!(file, ConfigFile::default());
+        assert!(note.unwrap().contains("created"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXAMPLE);
+        // The untouched example needs no approval.
+        let (file, note) = load_project(&path, &trusted, true).unwrap();
+        assert_eq!((file, note), (ConfigFile::default(), None));
+
+        std::fs::write(&path, "keychain = true\n").unwrap();
+        let err = load_project(&path, &trusted, true).unwrap_err();
+        assert!(err.contains("--trust-config"), "{err}");
+        trust(&path, &trusted).unwrap();
+        let (file, _) = load_project(&path, &trusted, true).unwrap();
+        assert_eq!(file.base.keychain, Some(true));
+
+        // A later change, by anyone, needs approving again.
+        std::fs::write(&path, "keychain = true\nrw = [\"~\"]\n").unwrap();
+        assert!(load_project(&path, &trusted, true).is_err());
+        // An invalid file is never approved.
+        std::fs::write(&path, "keychain = [").unwrap();
+        assert!(trust(&path, &trusted).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

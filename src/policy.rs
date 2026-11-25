@@ -252,8 +252,9 @@ pub struct Host {
     pub session_dir: Option<PathBuf>,
     /// The canonical path of this executable (Codex `ps` shim target).
     pub exe: Option<PathBuf>,
-    /// The config file this run loaded, wherever it lives.
-    pub config: Option<PathBuf>,
+    /// What decides this run's policy, wherever it lives: the config files
+    /// and the approvals of project config files. They need not exist.
+    pub configs: Vec<PathBuf>,
     /// Host PATH entries.
     pub path: Vec<PathBuf>,
     pub ssh_auth_sock: Option<PathBuf>,
@@ -396,6 +397,33 @@ pub fn resolve(
             }
         }
     }
+    // Read-only: gh aliases and config can name commands gh runs, and gh is
+    // also run by the user outside the jail.
+    let mut gh = Vec::new();
+    if s.gh.unwrap_or(true) {
+        // On by default, so only an explicit --gh warns when it cannot work.
+        let asked = s.gh == Some(true);
+        let dir = gh_config_dir(home, req.env);
+        if dir.is_dir() {
+            // gh keeps the token in the Keychain unless it was stored with
+            // `gh auth login --insecure-storage`.
+            let token_in_file = std::fs::read_to_string(dir.join("hosts.yml"))
+                .is_ok_and(|hosts| hosts.contains("oauth_token"));
+            if asked && !token_in_file && !keychain_enabled(s, req.agent) {
+                warnings.push(
+                    "--gh: gh keeps its token in the Keychain, which is \
+                     closed; add --keychain or gh will be logged out"
+                        .into(),
+                );
+            }
+            gh.push(Rule::subpath(canon(&dir)));
+        } else if asked {
+            warnings.push(format!(
+                "--gh: {} does not exist; run `gh auth login` first",
+                dir.display()
+            ));
+        }
+    }
     for raw in &s.unix_sockets {
         let path = expand_home(raw, home);
         if exists(&path) {
@@ -519,6 +547,7 @@ pub fn resolve(
         .iter()
         .chain(&extra_rw)
         .chain(&ssh)
+        .chain(&gh)
         .filter_map(rule_path)
         .collect();
     let mut secrets = Vec::new();
@@ -616,8 +645,8 @@ pub fn resolve(
         protected.push(Rule::subpath(canon(&home.join(rel))));
     }
     protected.push(Rule::subpath(canon(&home.join(".config/mac-agent-jail"))));
-    if let Some(config) = &host.config {
-        protected.push(Rule::literal(config));
+    for config in &host.configs {
+        protected.push(Rule::subpath(config));
     }
 
     // --- mach, shm -------------------------------------------------------
@@ -674,6 +703,7 @@ pub fn resolve(
         section("Agent installation (read-only)", install),
         section("Keychain support files", keychain_ro),
         section("SSH client config (--ssh-agent)", ssh),
+        section("GitHub CLI config (--gh)", gh),
         section("Codex ps helper", exe),
         section("Extra read-only paths (--ro)", extra_ro),
     ];
@@ -787,6 +817,16 @@ fn xcode_bundle() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Where the GitHub CLI keeps its config, as gh itself resolves it.
+fn gh_config_dir(home: &Path, env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    let set = |key: &str| env(key).filter(|value| !value.is_empty());
+    match (set("GH_CONFIG_DIR"), set("XDG_CONFIG_HOME")) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(xdg)) => Path::new(&xdg).join("gh"),
+        (None, None) => home.join(".config/gh"),
+    }
 }
 
 fn is_secret(home: &Path, path: &Path) -> bool {
@@ -910,7 +950,7 @@ mod tests {
                 user_cache_dir: Some(PathBuf::from("/private/var/folders/x/C")),
                 session_dir: Some(PathBuf::from("/private/var/folders/x/T/s")),
                 exe: Some(PathBuf::from("/opt/maj/bin/mac-agent-jail")),
-                config: Some(PathBuf::from("/opt/maj/etc/jail.toml")),
+                configs: vec![PathBuf::from("/opt/maj/etc/jail.toml")],
                 path: vec![
                     home.join(".nvm/versions/node/v22/bin"),
                     home.join(".ssh"),
@@ -1167,6 +1207,112 @@ mod tests {
     }
 
     #[test]
+    fn gh_config_is_shared_read_only_unless_turned_off() {
+        let fx = Fixture::new("gh");
+        let home = fx.home();
+        std::fs::create_dir_all(fx.host.home.join(".config/gh")).unwrap();
+        let hidden = format!(
+            "(deny file-read* file-write* (subpath \"{home}/.config/gh\"))"
+        );
+        let shared =
+            format!("(allow file-read* (subpath \"{home}/.config/gh\"))");
+
+        let off = Settings {
+            gh: Some(false),
+            ..Settings::default()
+        };
+        let text = fx.render(&off, None);
+        assert!(text.contains(&hidden));
+        assert!(!text.contains(&shared));
+
+        let text = fx.render(&Settings::default(), None);
+        assert!(text.contains(&shared));
+        assert!(!text.contains(&hidden));
+        // Never writable: gh config can name commands for gh to run.
+        assert!(!text.contains(&format!(
+            "(allow file-write* (subpath \"{home}/.config/gh\"))"
+        )));
+    }
+
+    #[test]
+    fn gh_warns_when_its_token_is_out_of_reach() {
+        let fx = Fixture::new("gh-warn");
+        let settings = Settings {
+            gh: Some(true),
+            ..Settings::default()
+        };
+        let warnings = |agent| {
+            let no_env = |_: &str| None;
+            let req = Request {
+                settings: &settings,
+                agent,
+                project: &fx.project,
+                program: None,
+                tty: None,
+                proxy_port: None,
+                env: &no_env,
+            };
+            resolve(&fx.host, &req).unwrap().1.join("\n")
+        };
+        assert!(warnings(None).contains("gh auth login"));
+        // The default is quiet: not everyone uses gh.
+        let no_env = |_: &str| None;
+        let req = Request {
+            settings: &Settings::default(),
+            agent: None,
+            project: &fx.project,
+            program: None,
+            tty: None,
+            proxy_port: None,
+            env: &no_env,
+        };
+        let (_, quiet) = resolve(&fx.host, &req).unwrap();
+        assert!(!quiet.iter().any(|w| w.contains("--gh")));
+
+        let dir = fx.host.home.join(".config/gh");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hosts.yml"), "github.com:\n  user: me\n")
+            .unwrap();
+        assert!(warnings(None).contains("--keychain"));
+        assert!(!warnings(Some(Agent::Claude)).contains("--gh"));
+
+        std::fs::write(
+            dir.join("hosts.yml"),
+            "github.com:\n  oauth_token: x\n",
+        )
+        .unwrap();
+        assert!(!warnings(None).contains("--gh"));
+    }
+
+    #[test]
+    fn gh_config_dir_follows_the_environment() {
+        let home = Path::new("/Users/me");
+        let env = |pairs: &'static [(&str, &str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            gh_config_dir(home, &env(&[])),
+            Path::new("/Users/me/.config/gh")
+        );
+        assert_eq!(
+            gh_config_dir(home, &env(&[("XDG_CONFIG_HOME", "/xdg")])),
+            Path::new("/xdg/gh")
+        );
+        assert_eq!(
+            gh_config_dir(
+                home,
+                &env(&[("XDG_CONFIG_HOME", "/xdg"), ("GH_CONFIG_DIR", "/gh")])
+            ),
+            Path::new("/gh")
+        );
+    }
+
+    #[test]
     fn env_files_are_hidden_with_example_exceptions() {
         let fx = Fixture::new("hide");
         let project = regex_escape(&fx.project.to_string_lossy());
@@ -1358,7 +1504,7 @@ mod tests {
         let fx = Fixture::new("config");
         let text = fx.render(&Settings::default(), None);
         assert!(text.contains(
-            "(deny file-write* (literal \"/opt/maj/etc/jail.toml\"))"
+            "(deny file-write* (subpath \"/opt/maj/etc/jail.toml\"))"
         ));
     }
 
