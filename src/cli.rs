@@ -44,6 +44,8 @@ HOST CAPABILITIES:
     --no-agent-state        do not share ~/.claude, ~/.codex, ~/.cursor,
                             or opencode's directories
     --ssh-agent             forward $SSH_AUTH_SOCK
+    --gh                    let the agent read the GitHub CLI config, so gh
+                            works with your account (needs the Keychain)
     --unix-socket PATH      allow connecting to a Unix socket (repeatable)
     --mach-service NAME     allow an extra Mach service lookup (repeatable)
     --open-urls             let the agent open URLs in the host browser
@@ -157,6 +159,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--no-agent-state" => s.agent_state = Some(false),
             "--ssh-agent" => s.ssh_agent = Some(true),
             "--no-ssh-agent" => s.ssh_agent = Some(false),
+            "--gh" => s.gh = Some(true),
+            "--no-gh" => s.gh = Some(false),
             "--open-urls" => s.open_urls = Some(true),
             "--no-open-urls" => s.open_urls = Some(false),
             "--clipboard" => s.clipboard = Some(true),
@@ -292,6 +296,7 @@ mod tests {
         let cli = parse_args(&["-n", "-v", "--no-pty"]).unwrap();
         assert!(cli.dry_run && cli.verbose && cli.no_pty);
         assert_eq!(cli.settings.footer, None);
+        assert_eq!(parse_args(&["--gh"]).unwrap().settings.gh, Some(true));
         assert_eq!(
             parse_args(&["--no-footer"]).unwrap().settings.footer,
             Some(false)

@@ -55,6 +55,7 @@ pub struct Settings {
     pub keychain: Option<bool>,
     pub agent_state: Option<bool>,
     pub ssh_agent: Option<bool>,
+    pub gh: Option<bool>,
     pub open_urls: Option<bool>,
     pub clipboard: Option<bool>,
     pub git_hooks: Option<bool>,
@@ -83,6 +84,7 @@ impl Settings {
         scalar(&mut self.keychain, &other.keychain);
         scalar(&mut self.agent_state, &other.agent_state);
         scalar(&mut self.ssh_agent, &other.ssh_agent);
+        scalar(&mut self.gh, &other.gh);
         scalar(&mut self.open_urls, &other.open_urls);
         scalar(&mut self.clipboard, &other.clipboard);
         scalar(&mut self.git_hooks, &other.git_hooks);
@@ -211,6 +213,8 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 
 # Optional host capabilities, all off by default.
 # ssh_agent = false   # forward $SSH_AUTH_SOCK (git over SSH)
+# gh = false          # read the GitHub CLI config (~/.config/gh), so `gh`
+#                     # works as you; its token is in the Keychain
 # open_urls = false   # let `open https://...` reach the host browser
 # clipboard = false   # pasteboard read/write (image paste)
 # git_hooks = false   # allow writing .git/hooks and .git/config, and

@@ -108,7 +108,12 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   because macOS refuses a nested `sandbox-exec` and the jail is already the
   sandbox.
 
-Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`,
+`--gh` shares the GitHub CLI config (`~/.config/gh`) read-only, so the
+agent can run `gh` as you: open pull requests, read issues, and anything
+else your token allows. gh keeps the token itself in the Keychain, so it
+also needs `--keychain` for agents that do not have it by default.
+
+Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`, `--gh`,
 `--open-urls`, `--clipboard`, `--unix-socket`, `--git-hooks`,
 `--ro/--rw/--deny`. See `mac-agent-jail --help`.
 
