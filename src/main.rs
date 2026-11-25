@@ -2,6 +2,7 @@ mod agents;
 mod cli;
 mod config;
 mod env;
+mod footer;
 mod policy;
 mod process;
 mod profile;
@@ -233,9 +234,18 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         && !cli.dry_run
         && process::is_tty(libc::STDIN_FILENO)
         && process::is_tty(libc::STDOUT_FILENO);
+    let footer = settings.footer.unwrap_or(true).then(|| {
+        footer_label(
+            agent.map_or("shell", Agent::name),
+            &project,
+            &home,
+            network,
+            policy::keychain_enabled(&settings, agent),
+        )
+    });
     let pty = if use_pty {
         Some(
-            process::Pty::open()
+            process::Pty::open(footer)
                 .map_err(|e| format!("cannot allocate a PTY: {e}"))?,
         )
     } else {
@@ -331,6 +341,25 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     }
     drop(session);
     Ok(process::exit_code(status))
+}
+
+/// The text of the footer on the last row of the terminal.
+fn footer_label(
+    what: &str,
+    project: &Path,
+    home: &Path,
+    network: NetworkMode,
+    keychain: bool,
+) -> String {
+    let project = match project.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => project.display().to_string(),
+    };
+    format!(
+        " mac-agent-jail | {what} | {project} | network {} | keychain {} ",
+        network.as_str(),
+        if keychain { "on" } else { "off" },
+    )
 }
 
 fn home_dir(value: Option<String>) -> Result<PathBuf, String> {
@@ -534,6 +563,31 @@ fn quote(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footer_names_the_project_and_what_is_open() {
+        let home = Path::new("/Users/me");
+        assert_eq!(
+            footer_label(
+                "claude",
+                Path::new("/Users/me/src/app"),
+                home,
+                NetworkMode::Filtered,
+                true
+            ),
+            " mac-agent-jail | claude | ~/src/app | network filtered | keychain on "
+        );
+        assert_eq!(
+            footer_label(
+                "shell",
+                Path::new("/Volumes/work"),
+                home,
+                NetworkMode::None,
+                false
+            ),
+            " mac-agent-jail | shell | /Volumes/work | network none | keychain off "
+        );
+    }
 
     #[test]
     fn quoting() {

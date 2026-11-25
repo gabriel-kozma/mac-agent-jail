@@ -57,6 +57,8 @@ OTHER:
     --config PATH           config file (default:
                             ~/.config/mac-agent-jail/config.toml)
     --no-pty                do not allocate a pseudo-terminal
+    --no-footer             do not show the jail footer on the last row of
+                            the terminal
     -n, --dry-run           print the Seatbelt profile and command, then exit
     -v, --verbose           print the profile before launching
     --print-config          print an example config file
@@ -162,6 +164,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "--unix-socket" => s.unix_sockets.push(value(&flag)?),
             "--mach-service" => s.mach_services.push(value(&flag)?),
             "--env" => s.env.push(value(&flag)?),
+            "--footer" => s.footer = Some(true),
+            "--no-footer" => s.footer = Some(false),
             "--inherit-env" => s.inherit_env = Some(true),
             "--no-inherit-env" => s.inherit_env = Some(false),
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
@@ -287,6 +291,11 @@ mod tests {
         );
         let cli = parse_args(&["-n", "-v", "--no-pty"]).unwrap();
         assert!(cli.dry_run && cli.verbose && cli.no_pty);
+        assert_eq!(cli.settings.footer, None);
+        assert_eq!(
+            parse_args(&["--no-footer"]).unwrap().settings.footer,
+            Some(false)
+        );
         assert!(cli.command.is_empty());
     }
 }

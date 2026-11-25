@@ -15,6 +15,8 @@ use std::{
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
+use crate::footer::Footer;
+
 static WINCH: AtomicBool = AtomicBool::new(false);
 static FORWARD: AtomicI32 = AtomicI32::new(0);
 
@@ -60,20 +62,25 @@ pub fn is_tty(fd: RawFd) -> bool {
 pub struct Pty {
     master: OwnedFd,
     slave: OwnedFd,
+    footer: Option<Footer>,
     pub path: PathBuf,
 }
 
 impl Pty {
-    pub fn open() -> io::Result<Pty> {
+    /// With a `footer` label, the last row of the host terminal shows it
+    /// and the new terminal is one row shorter.
+    pub fn open(footer: Option<String>) -> io::Result<Pty> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        let mut size =
-            window_size(libc::STDIN_FILENO).unwrap_or(libc::winsize {
-                ws_row: 24,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            });
+        let host = window_size(libc::STDIN_FILENO).unwrap_or(libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        });
+        let footer =
+            footer.map(|label| Footer::new(label, host.ws_row, host.ws_col));
+        let mut size = agent_size(host, footer.as_ref());
         // SAFETY: valid out-pointers; the terminal settings are inherited.
         let rc = unsafe {
             libc::openpty(
@@ -104,6 +111,7 @@ impl Pty {
         Ok(Pty {
             master,
             slave,
+            footer,
             path,
         })
     }
@@ -134,7 +142,41 @@ impl Pty {
         install_supervisor_handlers();
         install(libc::SIGWINCH, on_winch);
         let _raw = RawMode::enter(libc::STDIN_FILENO);
-        relay(self.master.as_raw_fd(), &mut child)
+        let mut footer = self.footer;
+        if let Some(footer) = &mut footer {
+            write_all(libc::STDOUT_FILENO, &footer.open());
+        }
+        let status = relay(self.master.as_raw_fd(), &mut child, &mut footer);
+        if let Some(footer) = &mut footer {
+            write_all(libc::STDOUT_FILENO, &footer.close());
+        }
+        status
+    }
+}
+
+/// The size of the agent's terminal: the host's, less the footer row.
+fn agent_size(host: libc::winsize, footer: Option<&Footer>) -> libc::winsize {
+    let rows = footer.map_or(host.ws_row, Footer::agent_rows);
+    let scale = |pixels: u16| {
+        (u32::from(pixels) * u32::from(rows) / u32::from(host.ws_row.max(1)))
+            as u16
+    };
+    libc::winsize {
+        ws_row: rows,
+        ws_ypixel: scale(host.ws_ypixel),
+        ..host
+    }
+}
+
+/// Write the agent's output to the host terminal, through the footer.
+fn show(footer: &mut Option<Footer>, data: &[u8], scratch: &mut Vec<u8>) {
+    match footer {
+        Some(footer) => {
+            scratch.clear();
+            footer.filter(data, scratch);
+            write_all(libc::STDOUT_FILENO, scratch);
+        }
+        None => write_all(libc::STDOUT_FILENO, data),
     }
 }
 
@@ -168,18 +210,31 @@ fn forward_signal(child: &Child) {
     }
 }
 
-fn relay(master: RawFd, child: &mut Child) -> io::Result<ExitStatus> {
+fn relay(
+    master: RawFd,
+    child: &mut Child,
+    footer: &mut Option<Footer>,
+) -> io::Result<ExitStatus> {
     let mut buf = [0u8; 16 * 1024];
+    let mut scratch = Vec::new();
     let mut stdin_open = true;
     loop {
         if WINCH.swap(false, Ordering::SeqCst)
-            && let Some(size) = window_size(libc::STDIN_FILENO)
+            && let Some(host) = window_size(libc::STDIN_FILENO)
         {
+            // Move the footer first: the agent redraws once it is resized.
+            if let Some(footer) = footer {
+                write_all(
+                    libc::STDOUT_FILENO,
+                    &footer.resize(host.ws_row, host.ws_col),
+                );
+            }
+            let size = agent_size(host, footer.as_ref());
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) };
         }
         forward_signal(child);
         if let Some(status) = child.try_wait()? {
-            drain(master, &mut buf);
+            drain(master, &mut buf, footer, &mut scratch);
             return Ok(status);
         }
 
@@ -203,10 +258,16 @@ fn relay(master: RawFd, child: &mut Child) -> io::Result<ExitStatus> {
             }
             return Err(err);
         }
+        if ready == 0
+            && let Some(footer) = footer
+        {
+            // The output went quiet: repair the footer if it was drawn over.
+            write_all(libc::STDOUT_FILENO, &footer.refresh());
+        }
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
         {
             match read_fd(master, &mut buf) {
-                Some(n) if n > 0 => write_all(libc::STDOUT_FILENO, &buf[..n]),
+                Some(n) if n > 0 => show(footer, &buf[..n], &mut scratch),
                 // EOF/EIO: every slave descriptor is closed.
                 _ => return child.wait(),
             }
@@ -222,7 +283,12 @@ fn relay(master: RawFd, child: &mut Child) -> io::Result<ExitStatus> {
 
 /// Copy whatever output is still buffered on the master after the child
 /// exited. Background processes may keep the slave open, so never block.
-fn drain(master: RawFd, buf: &mut [u8]) {
+fn drain(
+    master: RawFd,
+    buf: &mut [u8],
+    footer: &mut Option<Footer>,
+    scratch: &mut Vec<u8>,
+) {
     loop {
         let mut fd = libc::pollfd {
             fd: master,
@@ -235,7 +301,7 @@ fn drain(master: RawFd, buf: &mut [u8]) {
             return;
         }
         match read_fd(master, buf) {
-            Some(n) if n > 0 => write_all(libc::STDOUT_FILENO, &buf[..n]),
+            Some(n) if n > 0 => show(footer, &buf[..n], scratch),
             _ => return,
         }
     }
@@ -337,7 +403,7 @@ mod tests {
 
     #[test]
     fn pty_runs_a_command_with_a_controlling_terminal() {
-        let pty = Pty::open().unwrap();
+        let pty = Pty::open(None).unwrap();
         let path = pty.path.clone();
         assert!(path.to_string_lossy().starts_with("/dev/"));
         let mut cmd = Command::new("/bin/sh");

@@ -60,6 +60,7 @@ pub struct Settings {
     pub git_hooks: Option<bool>,
     pub default_hide: Option<bool>,
     pub inherit_env: Option<bool>,
+    pub footer: Option<bool>,
     pub ro: Vec<String>,
     pub rw: Vec<String>,
     pub deny: Vec<String>,
@@ -87,6 +88,7 @@ impl Settings {
         scalar(&mut self.git_hooks, &other.git_hooks);
         scalar(&mut self.default_hide, &other.default_hide);
         scalar(&mut self.inherit_env, &other.inherit_env);
+        scalar(&mut self.footer, &other.footer);
         self.allow_hosts.extend(other.allow_hosts.iter().cloned());
         self.local_ports.extend(other.local_ports.iter().copied());
         self.ro.extend(other.ro.iter().cloned());
@@ -213,6 +215,9 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration (~/.config/mac-agent
 # clipboard = false   # pasteboard read/write (image paste)
 # git_hooks = false   # allow writing .git/hooks and .git/config, and
 #                     # creating repositories (git clone, git init)
+
+# A line on the last row of the terminal saying the agent is jailed.
+# footer = true
 
 # Extra paths ("~" is expanded).
 # ro = ["~/work/shared-libs"]
