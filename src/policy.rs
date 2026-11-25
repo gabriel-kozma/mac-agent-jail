@@ -252,8 +252,9 @@ pub struct Host {
     pub session_dir: Option<PathBuf>,
     /// The canonical path of this executable (Codex `ps` shim target).
     pub exe: Option<PathBuf>,
-    /// The config file this run loaded, wherever it lives.
-    pub config: Option<PathBuf>,
+    /// What decides this run's policy, wherever it lives: the config files
+    /// and the approvals of project config files. They need not exist.
+    pub configs: Vec<PathBuf>,
     /// Host PATH entries.
     pub path: Vec<PathBuf>,
     pub ssh_auth_sock: Option<PathBuf>,
@@ -399,14 +400,16 @@ pub fn resolve(
     // Read-only: gh aliases and config can name commands gh runs, and gh is
     // also run by the user outside the jail.
     let mut gh = Vec::new();
-    if s.gh.unwrap_or(false) {
+    if s.gh.unwrap_or(true) {
+        // On by default, so only an explicit --gh warns when it cannot work.
+        let asked = s.gh == Some(true);
         let dir = gh_config_dir(home, req.env);
         if dir.is_dir() {
             // gh keeps the token in the Keychain unless it was stored with
             // `gh auth login --insecure-storage`.
             let token_in_file = std::fs::read_to_string(dir.join("hosts.yml"))
                 .is_ok_and(|hosts| hosts.contains("oauth_token"));
-            if !token_in_file && !keychain_enabled(s, req.agent) {
+            if asked && !token_in_file && !keychain_enabled(s, req.agent) {
                 warnings.push(
                     "--gh: gh keeps its token in the Keychain, which is \
                      closed; add --keychain or gh will be logged out"
@@ -414,7 +417,7 @@ pub fn resolve(
                 );
             }
             gh.push(Rule::subpath(canon(&dir)));
-        } else {
+        } else if asked {
             warnings.push(format!(
                 "--gh: {} does not exist; run `gh auth login` first",
                 dir.display()
@@ -642,8 +645,8 @@ pub fn resolve(
         protected.push(Rule::subpath(canon(&home.join(rel))));
     }
     protected.push(Rule::subpath(canon(&home.join(".config/mac-agent-jail"))));
-    if let Some(config) = &host.config {
-        protected.push(Rule::literal(config));
+    for config in &host.configs {
+        protected.push(Rule::subpath(config));
     }
 
     // --- mach, shm -------------------------------------------------------
@@ -947,7 +950,7 @@ mod tests {
                 user_cache_dir: Some(PathBuf::from("/private/var/folders/x/C")),
                 session_dir: Some(PathBuf::from("/private/var/folders/x/T/s")),
                 exe: Some(PathBuf::from("/opt/maj/bin/mac-agent-jail")),
-                config: Some(PathBuf::from("/opt/maj/etc/jail.toml")),
+                configs: vec![PathBuf::from("/opt/maj/etc/jail.toml")],
                 path: vec![
                     home.join(".nvm/versions/node/v22/bin"),
                     home.join(".ssh"),
@@ -1204,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn gh_config_is_hidden_unless_asked_for() {
+    fn gh_config_is_shared_read_only_unless_turned_off() {
         let fx = Fixture::new("gh");
         let home = fx.home();
         std::fs::create_dir_all(fx.host.home.join(".config/gh")).unwrap();
@@ -1214,15 +1217,15 @@ mod tests {
         let shared =
             format!("(allow file-read* (subpath \"{home}/.config/gh\"))");
 
-        let text = fx.render(&Settings::default(), None);
+        let off = Settings {
+            gh: Some(false),
+            ..Settings::default()
+        };
+        let text = fx.render(&off, None);
         assert!(text.contains(&hidden));
         assert!(!text.contains(&shared));
 
-        let settings = Settings {
-            gh: Some(true),
-            ..Settings::default()
-        };
-        let text = fx.render(&settings, None);
+        let text = fx.render(&Settings::default(), None);
         assert!(text.contains(&shared));
         assert!(!text.contains(&hidden));
         // Never writable: gh config can name commands for gh to run.
@@ -1252,6 +1255,19 @@ mod tests {
             resolve(&fx.host, &req).unwrap().1.join("\n")
         };
         assert!(warnings(None).contains("gh auth login"));
+        // The default is quiet: not everyone uses gh.
+        let no_env = |_: &str| None;
+        let req = Request {
+            settings: &Settings::default(),
+            agent: None,
+            project: &fx.project,
+            program: None,
+            tty: None,
+            proxy_port: None,
+            env: &no_env,
+        };
+        let (_, quiet) = resolve(&fx.host, &req).unwrap();
+        assert!(!quiet.iter().any(|w| w.contains("--gh")));
 
         let dir = fx.host.home.join(".config/gh");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1488,7 +1504,7 @@ mod tests {
         let fx = Fixture::new("config");
         let text = fx.render(&Settings::default(), None);
         assert!(text.contains(
-            "(deny file-write* (literal \"/opt/maj/etc/jail.toml\"))"
+            "(deny file-write* (subpath \"/opt/maj/etc/jail.toml\"))"
         ));
     }
 

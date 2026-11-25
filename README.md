@@ -56,7 +56,7 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   credential saved on this Mac. `--keychain` / `--no-keychain` override the
   default.
 - **Always hidden**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`,
-  `~/.config/gh`, `.netrc`, `.npmrc`, `~/.config/git/credentials`,
+  `.netrc`, `.npmrc`, `~/.config/git/credentials`,
   `~/.gradle/gradle.properties`, Mail and Messages, and similar stores.
   In the project, `.env` and `.env.*` are hidden (`.env.example` and similar
   stay visible).
@@ -108,18 +108,27 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   because macOS refuses a nested `sandbox-exec` and the jail is already the
   sandbox.
 
-`--gh` shares the GitHub CLI config (`~/.config/gh`) read-only, so the
-agent can run `gh` as you: open pull requests, read issues, and anything
+The GitHub CLI config (`~/.config/gh`) is shared read-only by default, so
+the agent can run `gh` as you: open pull requests, read issues, and anything
 else your token allows. gh keeps the token itself in the Keychain, so it
-also needs `--keychain` for agents that do not have it by default.
+also needs `--keychain` for agents that do not have it by default. `--no-gh`
+or `gh = false` hides the config again.
 
-Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`, `--gh`,
+Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`,
 `--open-urls`, `--clipboard`, `--unix-socket`, `--git-hooks`,
 `--ro/--rw/--deny`. See `mac-agent-jail --help`.
 
-Config: `~/.config/mac-agent-jail/config.toml` (`--print-config` prints an
-example), with `[agents.claude|codex|cursor|opencode]` tables. There is no
-per-project config, so a repository cannot widen its own sandbox.
+Config: `~/.config/mac-agent-jail/config.toml`, then `.mac-agent-jail.toml`
+at the root of the project, then the command line. Both files take
+`[agents.claude|codex|cursor|opencode]` tables; `--print-config` prints an
+example.
+
+The first run in a project creates `.mac-agent-jail.toml` with every
+setting commented out. A repository can ship that file, so it cannot widen
+its own sandbox: once the file sets anything, the jail refuses to start
+until you approve it with `mac-agent-jail --trust-config`, and again after
+every change. Approvals are kept under `~/.config/mac-agent-jail/trusted`.
+The agent can read the file but not change it.
 
 ## Development
 

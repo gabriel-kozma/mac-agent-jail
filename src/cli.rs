@@ -44,8 +44,9 @@ HOST CAPABILITIES:
     --no-agent-state        do not share ~/.claude, ~/.codex, ~/.cursor,
                             or opencode's directories
     --ssh-agent             forward $SSH_AUTH_SOCK
-    --gh                    let the agent read the GitHub CLI config, so gh
-                            works with your account (needs the Keychain)
+    --no-gh                 hide the GitHub CLI config (default: readable,
+                            so gh works with your account where the
+                            Keychain is open)
     --unix-socket PATH      allow connecting to a Unix socket (repeatable)
     --mach-service NAME     allow an extra Mach service lookup (repeatable)
     --open-urls             let the agent open URLs in the host browser
@@ -58,6 +59,9 @@ ENVIRONMENT:
 OTHER:
     --config PATH           config file (default:
                             ~/.config/mac-agent-jail/config.toml)
+    --trust-config          approve the project's .mac-agent-jail.toml as it
+                            is now. The file is created on the first run and
+                            refused while it sets anything unapproved
     --no-pty                do not allocate a pseudo-terminal
     --no-footer             do not show the jail footer on the last row of
                             the terminal
@@ -87,6 +91,7 @@ pub enum Action {
     Help,
     Version,
     PrintConfig,
+    TrustConfig,
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
@@ -123,6 +128,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
             "-h" | "--help" => cli.action = Action::Help,
             "-V" | "--version" => cli.action = Action::Version,
             "--print-config" => cli.action = Action::PrintConfig,
+            "--trust-config" => cli.action = Action::TrustConfig,
             "-n" | "--dry-run" => cli.dry_run = true,
             "-v" | "--verbose" => cli.verbose = true,
             "--no-pty" => cli.no_pty = true,
@@ -292,6 +298,10 @@ mod tests {
         assert_eq!(
             parse_args(&["--print-config"]).unwrap().action,
             Action::PrintConfig
+        );
+        assert_eq!(
+            parse_args(&["--trust-config"]).unwrap().action,
+            Action::TrustConfig
         );
         let cli = parse_args(&["-n", "-v", "--no-pty"]).unwrap();
         assert!(cli.dry_run && cli.verbose && cli.no_pty);

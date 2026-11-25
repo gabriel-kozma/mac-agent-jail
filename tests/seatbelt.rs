@@ -456,6 +456,35 @@ fn repositories_cannot_be_cloned_or_created_inside_the_project() {
 }
 
 #[test]
+fn the_project_config_is_created_and_cannot_be_rewritten() {
+    let project = Project::new("project-config");
+    let config = project.path.join(".mac-agent-jail.toml");
+    let script = r#"
+        [[ -r .mac-agent-jail.toml ]] || exit 3
+        if print -r -- 'rw = ["~"]' >> .mac-agent-jail.toml 2>/dev/null; then
+            exit 1
+        fi
+        if rm .mac-agent-jail.toml 2>/dev/null; then exit 2; fi
+        exit 0
+    "#;
+    let output = jail(&project.path, &[], &["/bin/zsh", "-c", script]);
+    assert!(output.status.success(), "config policy\n{}", show(&output));
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.starts_with("# mac-agent-jail configuration"));
+    assert!(!text.contains("\nrw = [\"~\"]"));
+
+    // A project file that sets something unapproved stops the run.
+    fs::write(&config, "keychain = true\n").unwrap();
+    let output = jail(&project.path, &[], &["/usr/bin/true"]);
+    assert_eq!(output.status.code(), Some(125), "{}", show(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--trust-config"),
+        "{}",
+        show(&output)
+    );
+}
+
+#[test]
 fn a_config_file_inside_the_project_cannot_be_rewritten() {
     let project = Project::new("config");
     let config = project.path.join("jail.toml");

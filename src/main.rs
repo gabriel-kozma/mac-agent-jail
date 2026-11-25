@@ -89,7 +89,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             print!("{}", config::EXAMPLE);
             return Ok(0);
         }
-        Action::Run => {}
+        Action::Run | Action::TrustConfig => {}
     }
 
     let host_env: Vec<(String, String)> = std::env::vars_os()
@@ -110,6 +110,42 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     });
     let config_file = config::load(&config_path)?;
 
+    // --- where -----------------------------------------------------------
+    let project = match &cli.project {
+        Some(dir) => dir.clone(),
+        None => std::env::current_dir()
+            .map_err(|e| format!("cannot read the current directory: {e}"))?,
+    };
+    let project = std::fs::canonicalize(&project)
+        .map_err(|e| format!("project {}: {e}", project.display()))?;
+    if !project.is_dir() {
+        return Err(format!(
+            "project {} is not a directory",
+            project.display()
+        ));
+    }
+    if home.starts_with(&project) {
+        return Err(format!(
+            "refusing to use {} as the project: it would make your whole \
+             home writable. cd into a project directory first.",
+            project.display()
+        ));
+    }
+
+    let project_config = project.join(config::PROJECT_FILE);
+    let trust_dir =
+        config::trust_dir(&home, getenv("XDG_CONFIG_HOME").as_deref());
+    if cli.action == Action::TrustConfig {
+        config::trust(&project_config, &trust_dir)?;
+        println!("approved {}", project_config.display());
+        return Ok(0);
+    }
+    let (project_file, note) =
+        config::load_project(&project_config, &trust_dir, !cli.dry_run)?;
+    if let Some(note) = note {
+        eprintln!("mac-agent-jail: {note}");
+    }
+
     // --- what to run -----------------------------------------------------
     let host_path: Vec<PathBuf> = getenv("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -121,6 +157,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         None => (None, DEFAULT_SHELL.to_string(), Vec::new()),
     };
     let mut settings = config_file.settings_for(agent.map(Agent::name));
+    settings.merge(&project_file.settings_for(agent.map(Agent::name)));
     settings.merge(&cli.settings);
     let network = settings.network_mode()?;
 
@@ -172,28 +209,6 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let shell_mode = cli.command.is_empty();
     if shell_mode {
         args.push("-i".into());
-    }
-
-    // --- where -----------------------------------------------------------
-    let project = match &cli.project {
-        Some(dir) => dir.clone(),
-        None => std::env::current_dir()
-            .map_err(|e| format!("cannot read the current directory: {e}"))?,
-    };
-    let project = std::fs::canonicalize(&project)
-        .map_err(|e| format!("project {}: {e}", project.display()))?;
-    if !project.is_dir() {
-        return Err(format!(
-            "project {} is not a directory",
-            project.display()
-        ));
-    }
-    if home.starts_with(&project) {
-        return Err(format!(
-            "refusing to use {} as the project: it would make your whole \
-             home writable. cd into a project directory first.",
-            project.display()
-        ));
     }
 
     if !cli.dry_run && !Path::new(SANDBOX_EXEC).is_file() {
@@ -259,9 +274,12 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         user_cache_dir: darwin_dir(DarwinDir::Cache),
         session_dir: session_dir.clone(),
         exe: std::env::current_exe().ok().map(|p| policy::canon(&p)),
-        config: std::path::absolute(&config_path)
+        configs: std::path::absolute(&config_path)
             .ok()
-            .map(|p| policy::canon(&p)),
+            .into_iter()
+            .chain([project_config.clone(), trust_dir.clone()])
+            .map(|p| policy::canon(&p))
+            .collect(),
         path: host_path.clone(),
         ssh_auth_sock: getenv("SSH_AUTH_SOCK").map(PathBuf::from),
     };

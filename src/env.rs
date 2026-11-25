@@ -126,7 +126,7 @@ pub fn build(input: &Input) -> Result<Vec<(String, String)>, String> {
     {
         env.insert("SSH_AUTH_SOCK".into(), sock.to_string());
     }
-    if s.gh.unwrap_or(false) {
+    if s.gh.unwrap_or(true) {
         for key in ["GH_CONFIG_DIR", "GH_HOST"] {
             if let Some(value) = host.get(key) {
                 env.insert(key.to_string(), value.to_string());
