@@ -318,14 +318,17 @@ pub const EXAMPLE: &str = r#"# mac-agent-jail configuration.
 # opencode's XDG directories).
 # agent_state = true
 
-# Optional host capabilities, all off by default.
-# ssh_agent = false   # forward $SSH_AUTH_SOCK (git over SSH)
-
 # The GitHub CLI config (~/.config/gh) is readable, so `gh` works as you
 # wherever the Keychain, which holds its token, is open. Set false to hide.
 # gh = true
+
+# The pasteboard is open, so copy and paste work in the agent. It also
+# lets the agent read whatever you last copied. Set false to close it.
+# clipboard = true
+
+# Optional host capabilities, all off by default.
+# ssh_agent = false   # forward $SSH_AUTH_SOCK (git over SSH)
 # open_urls = false   # let `open https://...` reach the host browser
-# clipboard = false   # pasteboard read/write (image paste)
 # git_hooks = false   # allow writing .git/hooks and .git/config, and
 #                     # creating repositories (git clone, git init)
 

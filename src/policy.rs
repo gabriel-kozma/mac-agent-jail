@@ -674,9 +674,9 @@ pub fn resolve(
             items: strings(OPEN_URL_MACH_SERVICES),
         });
     }
-    if s.clipboard.unwrap_or(false) {
+    if s.clipboard.unwrap_or(true) {
         mach.push(Section {
-            comment: "Pasteboard (--clipboard)",
+            comment: "Pasteboard (--no-clipboard closes it)",
             items: strings(CLIPBOARD_MACH_SERVICES),
         });
     }
@@ -1517,11 +1517,16 @@ mod tests {
     }
 
     #[test]
-    fn optional_capabilities_are_off_by_default() {
+    fn optional_capabilities() {
         let fx = Fixture::new("caps");
         let text = fx.render(&Settings::default(), None);
         assert!(!text.contains("launchservicesd"));
-        assert!(!text.contains("pasteboard"));
+        assert!(text.contains("com.apple.pasteboard.1"));
+        let closed = Settings {
+            clipboard: Some(false),
+            ..Settings::default()
+        };
+        assert!(!fx.render(&closed, None).contains("pasteboard"));
         let on = Settings {
             open_urls: Some(true),
             clipboard: Some(true),
