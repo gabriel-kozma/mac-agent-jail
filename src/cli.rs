@@ -50,7 +50,8 @@ HOST CAPABILITIES:
     --unix-socket PATH      allow connecting to a Unix socket (repeatable)
     --mach-service NAME     allow an extra Mach service lookup (repeatable)
     --open-urls             let the agent open URLs in the host browser
-    --clipboard             allow pasteboard access
+    --no-clipboard          block the pasteboard (default: open, so copy and
+                            paste work in the agent)
 
 ENVIRONMENT:
     --env NAME[=VALUE]      forward or set a variable (repeatable)

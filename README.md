@@ -114,9 +114,12 @@ else your token allows. gh keeps the token itself in the Keychain, so it
 also needs `--keychain` for agents that do not have it by default. `--no-gh`
 or `gh = false` hides the config again.
 
+The pasteboard is open by default, so copying from the agent and pasting
+text or images into it work. The agent can therefore read whatever you last
+copied; `--no-clipboard` or `clipboard = false` closes it.
+
 Opt-ins: `--keychain`, `--local-port`, `--localhost`, `--ssh-agent`,
-`--open-urls`, `--clipboard`, `--unix-socket`, `--git-hooks`,
-`--ro/--rw/--deny`. See `mac-agent-jail --help`.
+`--open-urls`, `--unix-socket`, `--git-hooks`, `--ro/--rw/--deny`. See `mac-agent-jail --help`.
 
 Config: `~/.config/mac-agent-jail/config.toml`, then `.mac-agent-jail.toml`
 at the root of the project, then the command line. Both files take

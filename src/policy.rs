@@ -66,6 +66,7 @@ const SYSTEM_METADATA: &[&str] = &[
 const HOME_TOOLCHAINS: &[&str] = &[
     ".local/bin",
     ".local/share/mise",
+    ".local/share/uv",
     ".config/mise",
     ".nvm",
     ".volta",
@@ -472,6 +473,13 @@ pub fn resolve(
         }
     }
 
+    // uv's installed tools and Pythons stay read-only (the user runs them
+    // outside the jail too), but every `uvx` locks the tools directory.
+    let uv_tools = home.join(".local/share/uv/tools");
+    if uv_tools.is_dir() {
+        caches.push(Rule::literal(canon(&uv_tools).join(".lock")));
+    }
+
     if let Some(cache) = &host.user_cache_dir {
         // clang and swiftc keep their module cache here, whatever TMPDIR is.
         caches.push(Rule::subpath(cache.join("clang")));
@@ -666,9 +674,9 @@ pub fn resolve(
             items: strings(OPEN_URL_MACH_SERVICES),
         });
     }
-    if s.clipboard.unwrap_or(false) {
+    if s.clipboard.unwrap_or(true) {
         mach.push(Section {
-            comment: "Pasteboard (--clipboard)",
+            comment: "Pasteboard (--no-clipboard closes it)",
             items: strings(CLIPBOARD_MACH_SERVICES),
         });
     }
@@ -1509,11 +1517,16 @@ mod tests {
     }
 
     #[test]
-    fn optional_capabilities_are_off_by_default() {
+    fn optional_capabilities() {
         let fx = Fixture::new("caps");
         let text = fx.render(&Settings::default(), None);
         assert!(!text.contains("launchservicesd"));
-        assert!(!text.contains("pasteboard"));
+        assert!(text.contains("com.apple.pasteboard.1"));
+        let closed = Settings {
+            clipboard: Some(false),
+            ..Settings::default()
+        };
+        assert!(!fx.render(&closed, None).contains("pasteboard"));
         let on = Settings {
             open_urls: Some(true),
             clipboard: Some(true),
