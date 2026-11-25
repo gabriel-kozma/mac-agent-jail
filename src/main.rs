@@ -374,7 +374,8 @@ fn footer_label(
         Err(_) => project.display().to_string(),
     };
     format!(
-        " mac-agent-jail | {what} | {project} | network {} | keychain {} ",
+        " mac-agent-jail {} | {what} | {project} | network {} | keychain {} ",
+        env!("CARGO_PKG_VERSION"),
         network.as_str(),
         if keychain { "on" } else { "off" },
     )
@@ -593,7 +594,11 @@ mod tests {
                 NetworkMode::Filtered,
                 true
             ),
-            " mac-agent-jail | claude | ~/src/app | network filtered | keychain on "
+            concat!(
+                " mac-agent-jail ",
+                env!("CARGO_PKG_VERSION"),
+                " | claude | ~/src/app | network filtered | keychain on "
+            )
         );
         assert_eq!(
             footer_label(
@@ -603,7 +608,11 @@ mod tests {
                 NetworkMode::None,
                 false
             ),
-            " mac-agent-jail | shell | /Volumes/work | network none | keychain off "
+            concat!(
+                " mac-agent-jail ",
+                env!("CARGO_PKG_VERSION"),
+                " | shell | /Volumes/work | network none | keychain off "
+            )
         );
     }
 

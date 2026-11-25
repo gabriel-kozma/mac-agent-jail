@@ -88,7 +88,8 @@ mac-agent-jail --dry-run claude  # print the Seatbelt profile
   CONNECT proxy, or `--net none`.
 - **Terminal**: the agent runs on its own PTY, so `TIOCSTI` cannot inject
   keystrokes into your shell. The last row of your terminal is kept for a
-  footer naming the jail, the project and what is open (network, Keychain),
+  footer naming the jail and its version, the project and what is open
+  (network, Keychain),
   so you can see at a glance that a session is confined. The agent gets a
   terminal one row shorter. Turn it off with `--no-footer` or
   `footer = false`.

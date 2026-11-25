@@ -213,7 +213,12 @@ const OPEN_URL_MACH_SERVICES: &[&str] = &[
     "com.apple.lsd.open",
 ];
 
-const CLIPBOARD_MACH_SERVICES: &[&str] = &["com.apple.pasteboard.1"];
+/// The pasteboard, and the type database that maps `NSStringPboardType` to
+/// `public.utf8-plain-text`. Without the database a jailed `pbcopy` files
+/// its text under a made-up `dyn.*` type nothing outside the jail reads,
+/// and `pbpaste` cannot find the text other applications copied.
+const CLIPBOARD_MACH_SERVICES: &[&str] =
+    &["com.apple.pasteboard.1", "com.apple.lsd.mapdb"];
 
 /// Directories (as regex fragments, at any depth in the project) where
 /// package managers check out git dependencies: SwiftPM, Carthage,
