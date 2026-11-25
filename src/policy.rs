@@ -66,6 +66,7 @@ const SYSTEM_METADATA: &[&str] = &[
 const HOME_TOOLCHAINS: &[&str] = &[
     ".local/bin",
     ".local/share/mise",
+    ".local/share/uv",
     ".config/mise",
     ".nvm",
     ".volta",
@@ -470,6 +471,13 @@ pub fn resolve(
         {
             caches.push(Rule::subpath(canon(&path)));
         }
+    }
+
+    // uv's installed tools and Pythons stay read-only (the user runs them
+    // outside the jail too), but every `uvx` locks the tools directory.
+    let uv_tools = home.join(".local/share/uv/tools");
+    if uv_tools.is_dir() {
+        caches.push(Rule::literal(canon(&uv_tools).join(".lock")));
     }
 
     if let Some(cache) = &host.user_cache_dir {
